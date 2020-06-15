@@ -1,0 +1,3 @@
+data/
+*.csv
+build-ec2.pem
