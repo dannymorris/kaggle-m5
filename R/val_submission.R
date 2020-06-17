@@ -18,6 +18,7 @@ library(lubridate)
 library(zoo)
 library(xgboost)
 library(ranger)
+library(parallel)
 
 # calendar reference
 calendar <- read_csv("calendar.csv") %>%
@@ -208,7 +209,6 @@ gc()
 ###########
 ## Model ##
 ###########
-library(parallel)
 
 n_cores <- parallel::detectCores()-1
 cl <- makeCluster(n_cores)
@@ -546,22 +546,4 @@ end_time <- Sys.time()
 end_time - start_time
 
 bind_rows(models) %>%
-  write_csv("submission.csv")
-
-
-
-## Add evaluation
-
-val_submission <- read_csv("submission.csv")
-
-eval_submission <- val_submission %>%
-  mutate(id = str_replace(id, "validation", "evaluation"))
-
-submission <- bind_rows(val_submission, eval_submission)
-
-template <- read_csv("data/sample_submission.csv") %>%
-  select(id)
-
-final_submission <- inner_join(template, submission, by = "id")
-
-write_csv(final_submission, "final_submission.csv")
+  write_csv("../val_submission.csv")

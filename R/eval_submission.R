@@ -18,6 +18,7 @@ library(lubridate)
 library(zoo)
 library(xgboost)
 library(ranger)
+library(parallel)
 
 # calendar reference
 calendar <- read_csv("calendar.csv")
@@ -48,6 +49,7 @@ sample_df <- read_csv("sales_train_evaluation.csv") %>%
          weekday,
          month)
 
+range(sample_df$date)
 
 ##############
 ## Calendar ##
@@ -88,6 +90,8 @@ ohe_calendar <- calendar %>%
 future_calendar <- ohe_calendar %>%
   filter(date >= "2016-05-21")
 
+range(future_calendar$date)
+
 ##########
 # Prices #
 ##########
@@ -98,6 +102,8 @@ future_prices <- prices %>%
   inner_join(future_calendar %>%
                select(date, wm_yr_wk), 
              by = "wm_yr_wk")
+
+range(future_prices$date)
 
 #################
 ## Sports data ##
@@ -179,6 +185,8 @@ future_sports_df <- future_calendar %>%
   replace(is.na(.), 0) %>%
   distinct()
 
+range(future_sports_df$date)
+
 ################
 ## Items list ##
 ################
@@ -204,10 +212,11 @@ items_list <- sample_df %>%
 rm(sample_df)
 gc()
 
+length(items_list)
+
 ###########
 ## Model ##
 ###########
-library(parallel)
 
 n_cores <- parallel::detectCores()-1
 cl <- makeCluster(n_cores)
@@ -545,22 +554,7 @@ end_time <- Sys.time()
 end_time - start_time
 
 bind_rows(models) %>%
-  write_csv("submission.csv")
+  write_csv("../eval_submission.csv")
 
 
 
-## Add evaluation
-
-val_submission <- read_csv("submission.csv")
-
-eval_submission <- val_submission %>%
-  mutate(id = str_replace(id, "validation", "evaluation"))
-
-submission <- bind_rows(val_submission, eval_submission)
-
-template <- read_csv("data/sample_submission.csv") %>%
-  select(id)
-
-final_submission <- inner_join(template, submission, by = "id")
-
-write_csv(final_submission, "final_submission.csv")
