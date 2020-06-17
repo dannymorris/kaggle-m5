@@ -1,3 +1,4 @@
 data/
 *.csv
 build-ec2.pem
+.Rproj.user

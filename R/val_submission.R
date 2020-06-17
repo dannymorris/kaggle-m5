@@ -1,19 +1,27 @@
 
 
-## Run this on EC2!!!!!
+## Run this on EC2 using RStudio AMI
+
+install.packages("recipes")
+install.packages("mlbgameday")
+install.packages("devtools")
+devtools::install_github("abresler/nbastatR")
+install.packages("zoo")
+install.packages("xgboost")
+install.packages("ranger")
 
 library(tidyverse)
-library(recipes)
+library(recipes) 
 library(mlbgameday)
 library(nbastatR)
 library(lubridate)
 library(zoo)
 library(xgboost)
 library(ranger)
-library(furrr)
 
 # calendar reference
-calendar <- read_csv("calendar.csv")
+calendar <- read_csv("calendar.csv") %>%
+  filter(date <= "2016-05-22")
 
 # prices
 prices <- read_csv("sell_prices.csv") %>%
@@ -75,12 +83,11 @@ ohe_calendar <- calendar %>%
   select(-contains("event"), -wday,  -year) %>%
   bind_cols(ohe_date) %>%
   left_join(ohe_holidays, by = "date") %>%
-  replace(is.na(.), 0) %>%
-  select(-wm_yr_wk)
+  replace(is.na(.), 0)
 
 # future calendar dates
 future_calendar <- ohe_calendar %>%
-  filter(date >= "2016-05-21")
+  filter(date >= "2016-04-25")
 
 ##########
 # Prices #
@@ -203,7 +210,7 @@ gc()
 ###########
 library(parallel)
 
-n_cores <- availableCores()-1
+n_cores <- parallel::detectCores()-1
 cl <- makeCluster(n_cores)
 clusterExport(cl, c("ohe_calendar",
                     "future_calendar",
@@ -512,7 +519,7 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   future_xgb_mat <- future_model_tbl %>%
     select(which(colnames(future_model_tbl) %in% colnames(train))) %>%
     select(-date) %>%
-    select(all_of(colnames(train_mat))) %>%
+    select(colnames(train_mat)) %>%
     as.matrix()
   
   rf_fcast <- predict(rf, data = future_model_tbl)$predictions
@@ -522,6 +529,7 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   out <- future_model_tbl %>%
     select(date) %>%
     mutate(Prediction = ens_fcast) %>%
+    mutate(Prediction = ifelse(Prediction < 0, 0, Prediction)) %>%
     mutate(id = paste(item_ID, store_ID, "validation", sep = "_")) %>%
     inner_join(future_calendar %>%
                  select(date, d),

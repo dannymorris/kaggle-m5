@@ -1,0 +1,566 @@
+
+
+## Run this on EC2 using RStudio AMI
+
+install.packages("recipes")
+install.packages("mlbgameday")
+install.packages("devtools")
+devtools::install_github("abresler/nbastatR")
+install.packages("zoo")
+install.packages("xgboost")
+install.packages("ranger")
+
+library(tidyverse)
+library(recipes) 
+library(mlbgameday)
+library(nbastatR)
+library(lubridate)
+library(zoo)
+library(xgboost)
+library(ranger)
+
+# calendar reference
+calendar <- read_csv("calendar.csv")
+
+# prices
+prices <- read_csv("sell_prices.csv") %>%
+  mutate(store_item = paste(item_id, store_id, sep = "_")) %>%
+  select(-item_id,
+         -store_id)
+
+# training set
+sample_df <- read_csv("sales_train_evaluation.csv") %>%
+  mutate(store_item = paste(item_id, store_id, sep = "_")) %>%
+  gather(Date, Value, -id:-state_id, -store_item) %>%
+  inner_join(calendar, by = c("Date" = "d")) %>%
+  left_join(prices, by = c("store_item", "wm_yr_wk")) %>%
+  select(id,
+         item_id,
+         dept_id,
+         cat_id,
+         store_id,
+         state_id,
+         Date,
+         wm_yr_wk,
+         Value,
+         date,
+         store_item,
+         weekday,
+         month)
+
+
+##############
+## Calendar ##
+##############
+
+# one-hot enconde date components
+# weekday, weekmonth, month, year
+ohe_date <- calendar %>%
+  mutate(weekmonth = stringi::stri_datetime_fields(date)$WeekOfMonth) %>%
+  select(weekday, weekmonth, month, year) %>%
+  mutate_at(vars(weekmonth, month, year), as.factor) %>%
+  recipes::recipe(~., data = .) %>%
+  step_dummy(all_predictors(), one_hot = T) %>%
+  prep() %>%
+  juice()
+
+# one-hot encode holidays
+ohe_holidays <- calendar %>%
+  select(date, contains("event")) %>%
+  gather(key, event, -date) %>%
+  drop_na() %>%
+  select(-key) %>%
+  mutate(Ind = 1) %>%
+  mutate(event = str_replace_all(event, " ", "")) %>%
+  mutate(event = str_replace_all(event, "[^[:alnum:]]", "")) %>%
+  mutate(event = paste("event", event, sep = "_")) %>%
+  distinct() %>%
+  spread(event, Ind, fill = 0) 
+
+# combine OHE dates and holidays
+ohe_calendar <- calendar %>%
+  select(-contains("event"), -wday,  -year) %>%
+  bind_cols(ohe_date) %>%
+  left_join(ohe_holidays, by = "date") %>%
+  replace(is.na(.), 0)
+
+# future calendar dates
+future_calendar <- ohe_calendar %>%
+  filter(date >= "2016-05-21")
+
+##########
+# Prices #
+##########
+
+#prices <- read_csv("sell_prices.csv")
+
+future_prices <- prices %>%
+  inner_join(future_calendar %>%
+               select(date, wm_yr_wk), 
+             by = "wm_yr_wk")
+
+#################
+## Sports data ##
+#################
+
+# NFL Sunday and College football Saturday
+football <- calendar %>%
+  select(date, weekday, month) %>%
+  distinct() %>%
+  mutate(NFL_Sun = ifelse(weekday == "Sunday" & (month > 8 | month < 2), 1, 0)) %>%
+  mutate(NCAA_Sat = ifelse(weekday == "Saturday" & (month > 8 & month <= 12), 1, 0)) %>%
+  select(date, NFL_Sun, NCAA_Sat) %>%
+  distinct()
+
+# NBA Finals schedule
+# nba_finals <- nbastatR::seasons_schedule(2011:2016, season_types = 'Playoffs') %>%
+#   mutate(Month = lubridate::month(dateGame)) %>%
+#   filter(Month == 6) %>%
+#   select(date = dateGame) %>%
+#   mutate(NBA_Finals = 1)
+nba_finals <- read_csv("nba_finals.csv")
+
+# US Open (Sundays)
+us_open <- read_csv("us_open.csv") %>%
+  mutate(date = lubridate::mdy(date)) %>%
+  mutate(USO_Sunday = 1) %>%
+  select(-event)
+
+# MLB schedule for teams in WI, CA, and TX
+teams <- tibble::tribble(
+  ~team, ~state_id,
+  "Brewers", "WI",
+  "Angels", "CA",
+  "Padres", "CA",
+  "Athletics", "CA",
+  "Giants", "CA",
+  "Dodgers", "CA",
+  "Astros", "TX",
+  "Rangers", "TX"
+)
+
+mlb <- mlbgameday::game_ids %>% 
+  as_tibble() %>%
+  mutate(date = as.Date(date_dt)) %>%
+  select(date, home_team_name, away_team_name) %>%
+  gather(home_away, team, -date) %>%
+  inner_join(teams, by = "team") %>%
+  filter(date >= "2011-01-01", date <= "2016-07-01") %>%
+  group_by(date, state_id, home_away) %>%
+  count() %>%
+  mutate(home_away_state = paste("MLB", substr(home_away, 1, 4), state_id, sep = "_")) %>%
+  ungroup() %>%
+  select(-home_away, -state_id) %>%
+  spread(home_away_state, n) %>%
+  replace(is.na(.), 0)
+
+# Horse racing (triple crown)
+horse_race <- read_csv("horse_racing.csv") %>%
+  mutate(date = lubridate::mdy(date)) %>%
+  mutate(Horse_Race = 1) %>%
+  spread(event, Horse_Race, fill = 0)
+
+# Combine football, nba, us open, mlb, and horse racing
+ohe_sports <- left_join(football, nba_finals, by = "date") %>%
+  left_join(us_open, by = "date") %>%
+  left_join(mlb, by = "date") %>%
+  left_join(horse_race, by = "date") %>%
+  replace(is.na(.), 0)
+
+# future sports dates
+future_sports_df <- future_calendar %>%
+  mutate(NFL_Sun = ifelse(weekday == "Sunday" & (month > 8 | month < 2), 1, 0)) %>%
+  mutate(NCAA_Sat = ifelse(weekday == "Saturday" & (month > 8 & month <= 12), 1, 0)) %>%
+  select(date, NFL_Sun, NCAA_Sat) %>%
+  left_join(nba_finals, by = "date") %>%
+  left_join(us_open, by = "date") %>%
+  left_join(mlb, by = "date") %>%
+  left_join(horse_race, by = "date") %>%
+  replace(is.na(.), 0) %>%
+  distinct()
+
+################
+## Items list ##
+################
+
+# separate all items using list
+# modeling will use split-apply-combine method
+items_list <- sample_df %>%
+  inner_join(prices, by = c("store_item", "wm_yr_wk")) %>%
+  select(id,
+         store_item,
+         item_id,
+         dept_id,
+         cat_id,
+         store_id,
+         state_id,
+         date,
+         wm_yr_wk,
+         contains("snap"),
+         sell_price,
+         Value) %>%
+  split(., .$store_item)
+
+rm(sample_df)
+gc()
+
+###########
+## Model ##
+###########
+library(parallel)
+
+n_cores <- parallel::detectCores()-1
+cl <- makeCluster(n_cores)
+clusterExport(cl, c("ohe_calendar",
+                    "future_calendar",
+                    "ohe_sports",
+                    "future_sports_df",
+                    "future_prices"))
+
+start_time <- Sys.time()
+
+models <- parallel::parLapply(cl, items_list, function(df) {
+  
+  library(tidyverse)
+  library(lubridate)
+  library(zoo)
+  library(xgboost)
+  library(ranger)
+  
+  # item ids
+  item_state <- unique(df$state_id)
+  item_ID <- unique(df$item_id)
+  store_ID <- unique(df$store_id)
+  
+  ######################################
+  ## Sales data with point indicators ##
+  ######################################
+  
+  # combine daily calendar, sports, prices data
+  # no lead/lag indicators yet
+  point_indicators <- df %>%
+    #select(-weekday, -month) %>%
+    inner_join(ohe_calendar, by = "date") %>%
+    inner_join(ohe_sports, by = "date") %>%
+    #left_join(prices, by = c("store_item", "wm_yr_wk")) %>%
+    select(-contains("NBAFinalsEnd"),
+           -contains("NBAFinalsStart")) %>%
+    drop_na()
+  
+  #################################
+  ## Calendar leading indicators ##
+  #################################
+  
+  # calendar events that are known in advance
+  # variables: holidays, sports
+  calendar_lead_vars <- point_indicators %>%
+    select(date, 
+           contains('event'),
+           contains("MLB"),
+           NFL_Sun,
+           NCAA_Sat,
+           NBA_Finals,
+           USO_Sunday,
+           contains("Horse")) %>%
+    distinct()
+  
+  # create leading indicators up to 2 days
+  calendar_lead <- map(seq(1, 2, 1), function(val) {
+    lead_val <- function(x) lead(x, val)
+    calendar_lead_vars %>%
+      select(-date) %>%
+      mutate_all(list(lead_val)) %>%
+      setNames(., nm = paste(names(.), "Lead", val, sep = "_"))
+  }) %>%
+    bind_cols(calendar_lead_vars, .)
+  
+  # future leads
+  future_lead_vars <- future_calendar %>%
+    inner_join(future_sports_df, by = "date") %>%
+    select(date, 
+           contains('event'),
+           contains("MLB"),
+           NFL_Sun,
+           NCAA_Sat,
+           NBA_Finals,
+           USO_Sunday,
+           contains("Horse"))
+  
+  future_lead_tbls <- map(seq(1, 2, 1), function(val) {
+    lead_val <- function(x) lead(x, val)
+    future_lead_vars %>%
+      select(-date) %>%
+      mutate_all(list(lead_val)) %>%
+      setNames(., nm = paste(names(.), "Lead", val, sep = "_"))
+  }) %>%
+    bind_cols(future_lead_vars, .)
+  
+  
+  #################################
+  ## Calendar lagging indicators ##
+  #################################
+  
+  # calendar events that influence future sales
+  # lags up to 1 day
+  # variables: Black Friday, post-Christmas
+  calendar_lag <- point_indicators %>%
+    select(date,
+           event_Thanksgiving,
+           event_Christmas) %>%
+    distinct() %>%
+    mutate(event_Thanksgiving_Lag_1 = lag(event_Thanksgiving, 1),
+           event_Christmas_Lag_1 = lag(event_Christmas, 1)) %>%
+    select(date,
+           event_Thanksgiving_Lag_1,
+           event_Christmas_Lag_1)
+  
+  ###############################
+  ## Calendar fixed indicators ##
+  ###############################
+  
+  # point indicators with no lead/lag component
+  calendar_fixed <- point_indicators %>%
+    select(date,
+           contains("weekday"),
+           contains("month"),
+           contains("year"),
+           contains("weekmonth"),
+           -contains("event"),
+           -weekday,
+           -month) %>%
+    distinct()
+  
+  # future fixed
+  future_fixed_tbls <- future_calendar %>%
+    select(date,
+           contains("snap"),
+           contains("weekday"),
+           contains("month"),
+           contains("year"),
+           contains("weekmonth"),
+           -contains("event"),
+           -weekday,
+           -month)
+  
+  ###############
+  # subset SNAP #
+  ###############
+  
+  # get state SNAP indicators
+  item_snap <- df %>%
+    select(date, contains("snap")) %>%
+    select(date, contains(item_state))
+  
+  ##############
+  # subset MLB #
+  ##############
+  
+  # get MLB games in item state
+  item_mlb_state <- calendar_lead %>%
+    select(date, contains("MLB")) %>%
+    select(date, contains(item_state))
+  
+  ###############
+  # Item prices #
+  ###############
+  
+  # point price with lag-1
+  item_prices <- df %>%
+    mutate(sell_price_Lag_1 = lag(sell_price, 1)) %>%
+    mutate(sell_price_diff = sell_price - lag(sell_price, 1)) %>%
+    select(date,
+           sell_price_Lag_1)
+  
+  #########################
+  # Rolling sales metrics #
+  #########################
+  
+  # moving medians (7, 14, and 30 day)
+  # moving standard devs (7, 14, and 30 day)
+  # moving stats backshifted by 30 days to enable 30-day forecasts
+  item_rolling <- df %>%
+    select(date, Value) %>%
+    mutate(Roll_Median_30 = zoo::rollmedian(Value, 29, align = 'right', fill = NA)) %>%
+    mutate(Roll_Median_7 = zoo::rollmedian(Value, 7, align = 'right', fill = NA)) %>%
+    mutate(Roll_Median_14 = zoo::rollmedian(Value, 13, align = 'right', fill = NA)) %>%
+    mutate(Roll_Median_30_Shift = lag(Roll_Median_30, 29)) %>%
+    mutate(Roll_Median_7_Shift = lag(Roll_Median_7, 29)) %>%
+    mutate(Roll_Median_14_Shift = lag(Roll_Median_14, 29)) %>%
+    mutate(Roll_Sd_30 = zoo::rollapply(Value, 30, sd, align = 'right', fill = NA)) %>%
+    mutate(Roll_Sd_7 = zoo::rollapply(Value, 7, sd, align = 'right', fill = NA)) %>%
+    mutate(Roll_Sd_14 = zoo::rollapply(Value, 14, sd, align = 'right', fill = NA)) %>%
+    mutate(Roll_Sd_30_Shift = lag(Roll_Sd_30, 30)) %>%
+    mutate(Roll_Sd_7_Shift = lag(Roll_Sd_7, 30)) %>%
+    mutate(Roll_Sd_14_Shift = lag(Roll_Sd_14, 30)) %>%
+    select(date, 
+           contains("Shift"))
+  
+  ##################
+  # Modeling table #
+  ##################
+  
+  # combine prices, SNAP, rolling stats, holidays, dates, leads, lags
+  # extra indicator for zero demand
+  model_tbl <- df %>%
+    select(-contains("snap")) %>%
+    inner_join(item_prices, by = "date") %>%
+    inner_join(item_snap, by = "date") %>%
+    inner_join(item_rolling, by = "date") %>%
+    inner_join(calendar_lead, by = "date") %>%
+    select(-contains("MLB")) %>%
+    inner_join(item_mlb_state, by = "date") %>%
+    inner_join(calendar_lag, by = "date") %>%
+    inner_join(calendar_fixed, by = "date") %>%
+    mutate(Zero_Demand = ifelse(Value == 0, 1, 0))
+  
+  #################
+  # Training data #
+  #################
+  
+  train <- model_tbl %>% 
+    drop_na() %>%
+    select(date,
+           contains("year"),
+           contains("month"),
+           contains("weekday"),
+           contains("weekmonth"),
+           contains("snap"),
+           contains("NFL"),
+           contains("NBA"),
+           contains("NCAA"),
+           contains("USO"),
+           contains("MLB"),
+           contains("Horse"),
+           contains("event"),
+           contains("Roll"),
+           sell_price,
+           Value,
+           Zero_Demand)
+  
+  #################
+  # Random forest #
+  #################
+  
+  # fit
+  mtry <- ncol(train)-2
+  rf <- ranger::ranger(
+    formula = Value ~ .,
+    data = train %>% select(-date),
+    importance = 'impurity',
+    mtry = mtry,
+    num.trees = 250
+  )
+  
+  #############
+  ## XGBoost ##
+  #############
+  
+  train_mat <- train %>% 
+    select(-Value, -date) %>% 
+    as.matrix()
+  
+  xgb <- xgboost(data = train_mat, 
+                 label = as.matrix(train$Value), 
+                 eta = 0.1, 
+                 nthread = 2, 
+                 nrounds = 100, 
+                 max.depth = 5,
+                 early_stopping_rounds = 10,
+                 objective = "reg:squarederror",
+                 verbose = F) 
+  
+  ############
+  # Forecast #
+  ############
+  
+  # future prices
+  future_item_prices <- future_prices %>%
+    semi_join(df, by = c("store_item")) %>%
+    select(date, sell_price)
+  
+  # future lags
+  future_lag_tbls <- inner_join(future_calendar, future_item_prices, by = "date") %>%
+    mutate(sell_price_Lag_1 = lag(sell_price, 1),
+           event_Thanksgiving_Lag_1 = lag(event_Thanksgiving, 1),
+           event_Christmas_Lag_1 = lag(event_Christmas, 1)) %>%
+    select(date, 
+           sell_price,
+           sell_price_Lag_1,
+           event_Thanksgiving_Lag_1,
+           event_Christmas_Lag_1)
+  
+  # future rolling
+  future_rolling <- df %>%
+    arrange(date) %>%
+    tail(60) %>%
+    mutate(Roll_Median_30_Shift = zoo::rollmedian(Value, 29, align = 'right', fill = NA)) %>%
+    mutate(Roll_Median_7_Shift = zoo::rollmedian(Value, 7, align = 'right', fill = NA)) %>%
+    mutate(Roll_Median_14_Shift = zoo::rollmedian(Value, 13, align = 'right', fill = NA)) %>%
+    mutate(Roll_Sd_30_Shift = zoo::rollapply(Value, 30, sd, align = 'right', fill = NA)) %>%
+    mutate(Roll_Sd_7_Shift = zoo::rollapply(Value, 7, sd, align = 'right', fill = NA)) %>%
+    mutate(Roll_Sd_14_Shift = zoo::rollapply(Value, 14, sd, align = 'right', fill = NA)) %>%
+    select(date, 
+           Roll_Median_30_Shift:Roll_Sd_14_Shift) %>%
+    drop_na() %>%
+    mutate(date = date + months(1))
+  
+  # future modeling table
+  future_model_tbl <- future_calendar %>%
+    select(date) %>%
+    inner_join(future_rolling, by = "date") %>%
+    inner_join(future_lead_tbls, by = "date") %>%
+    inner_join(future_lag_tbls, by = "date") %>%
+    inner_join(future_fixed_tbls, by = "date") %>%
+    select(date, everything()) %>%
+    mutate(Zero_Demand = 0) %>%
+    replace(is.na(.), 0)
+  
+  future_xgb_mat <- future_model_tbl %>%
+    select(which(colnames(future_model_tbl) %in% colnames(train))) %>%
+    select(-date) %>%
+    select(colnames(train_mat)) %>%
+    as.matrix()
+  
+  rf_fcast <- predict(rf, data = future_model_tbl)$predictions
+  xgb_fcast <- predict(xgb, newdata = future_xgb_mat)
+  ens_fcast <- (rf_fcast + xgb_fcast)/2
+  
+  out <- future_model_tbl %>%
+    select(date) %>%
+    mutate(Prediction = ens_fcast) %>%
+    mutate(Prediction = ifelse(Prediction < 0, 0, Prediction)) %>%
+    mutate(id = paste(item_ID, store_ID, "validation", sep = "_")) %>%
+    inner_join(future_calendar %>%
+                 select(date, d),
+               by = "date") %>%
+    select(-date) %>%
+    spread(d, Prediction) %>%
+    setNames(., nm = c("id", paste("F", 1:28, sep = "")))
+  
+  return(out)
+})
+
+end_time <- Sys.time()
+
+end_time - start_time
+
+bind_rows(models) %>%
+  write_csv("submission.csv")
+
+
+
+## Add evaluation
+
+val_submission <- read_csv("submission.csv")
+
+eval_submission <- val_submission %>%
+  mutate(id = str_replace(id, "validation", "evaluation"))
+
+submission <- bind_rows(val_submission, eval_submission)
+
+template <- read_csv("data/sample_submission.csv") %>%
+  select(id)
+
+final_submission <- inner_join(template, submission, by = "id")
+
+write_csv(final_submission, "final_submission.csv")
