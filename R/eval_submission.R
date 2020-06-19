@@ -212,8 +212,6 @@ items_list <- sample_df %>%
 rm(sample_df)
 gc()
 
-length(items_list)
-
 ###########
 ## Model ##
 ###########
@@ -227,6 +225,8 @@ clusterExport(cl, c("ohe_calendar",
                     "future_prices"))
 
 start_time <- Sys.time()
+
+#df <- items_list[[31]]
 
 models <- parallel::parLapply(cl, items_list, function(df) {
   
@@ -248,6 +248,7 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   # combine daily calendar, sports, prices data
   # no lead/lag indicators yet
   point_indicators <- df %>%
+    mutate(released = ifelse(cumsum(Value > 0), 1, 0)) %>%
     #select(-weekday, -month) %>%
     inner_join(ohe_calendar, by = "date") %>%
     inner_join(ohe_sports, by = "date") %>%
@@ -375,10 +376,16 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   
   # point price with lag-1
   item_prices <- df %>%
+    mutate(roll_mean = rollmean(sell_price, 119, fill = NA, align = 'right')) %>%
+    mutate(promo = ifelse((sell_price - roll_mean)/roll_mean <= -0.02, 1, 0)) %>%
+    mutate(hike = ifelse((sell_price - roll_mean)/roll_mean >= 0.02, 1, 0)) %>%
     mutate(sell_price_Lag_1 = lag(sell_price, 1)) %>%
     mutate(sell_price_diff = sell_price - lag(sell_price, 1)) %>%
+    mutate(sell_price_change = ((lag(sell_price) - sell_price)/sell_price)) %>%
     select(date,
-           sell_price_Lag_1)
+           sell_price_Lag_1,
+           promo,
+           hike)
   
   #########################
   # Rolling sales metrics #
@@ -443,8 +450,11 @@ models <- parallel::parLapply(cl, items_list, function(df) {
            contains("event"),
            contains("Roll"),
            sell_price,
+           promo,
+           hike,
            Value,
-           Zero_Demand)
+           Zero_Demand) %>%
+    select(-promo)
   
   #################
   # Random forest #
@@ -457,7 +467,7 @@ models <- parallel::parLapply(cl, items_list, function(df) {
     data = train %>% select(-date),
     importance = 'impurity',
     mtry = mtry,
-    num.trees = 250
+    num.trees = 500
   )
   
   #############
@@ -485,7 +495,17 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   # future prices
   future_item_prices <- future_prices %>%
     semi_join(df, by = c("store_item")) %>%
-    select(date, sell_price)
+    select(date, 
+           sell_price) %>%
+    bind_rows(df %>% 
+                select(date, sell_price) %>%
+                tail(120)) %>%
+    distinct() %>%
+    arrange(date) %>%
+    mutate(roll_mean = rollmean(sell_price, 119, fill = NA, align = 'right')) %>%
+    mutate(promo = ifelse((sell_price - roll_mean)/roll_mean <= -0.02, 1, 0)) %>%
+    mutate(hike = ifelse((sell_price - roll_mean)/roll_mean >= 0.02, 1, 0)) %>%
+    semi_join(future_prices, by = "date")
   
   # future lags
   future_lag_tbls <- inner_join(future_calendar, future_item_prices, by = "date") %>%
@@ -516,6 +536,7 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   # future modeling table
   future_model_tbl <- future_calendar %>%
     select(date) %>%
+    inner_join(future_item_prices %>% select(date, hike, promo), by = "date") %>%
     inner_join(future_rolling, by = "date") %>%
     inner_join(future_lead_tbls, by = "date") %>%
     inner_join(future_lag_tbls, by = "date") %>%
@@ -538,7 +559,7 @@ models <- parallel::parLapply(cl, items_list, function(df) {
     select(date) %>%
     mutate(Prediction = ens_fcast) %>%
     mutate(Prediction = ifelse(Prediction < 0, 0, Prediction)) %>%
-    mutate(id = paste(item_ID, store_ID, "validation", sep = "_")) %>%
+    mutate(id = paste(item_ID, store_ID, "evaluation", sep = "_")) %>%
     inner_join(future_calendar %>%
                  select(date, d),
                by = "date") %>%
@@ -546,12 +567,24 @@ models <- parallel::parLapply(cl, items_list, function(df) {
     spread(d, Prediction) %>%
     setNames(., nm = c("id", paste("F", 1:28, sep = "")))
   
-  return(out)
+  list(predictions = out,
+       rf_rsq = rf$r.squared) %>%
+    return()
 })
 
 end_time <- Sys.time()
 
 end_time - start_time
+
+map(models, function(m) {
+  m[['predictions']]
+}) %>%
+  bind_rows() %>%
+  write_csv("../eval_submission.csv")
+
+map_dbl(models, function(m) {
+  m[['rf_rsq']]
+})
 
 bind_rows(models) %>%
   write_csv("../eval_submission.csv")
