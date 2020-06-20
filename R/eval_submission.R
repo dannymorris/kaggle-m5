@@ -380,8 +380,12 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   
   # point price with lag-1
   item_prices <- df %>%
+<<<<<<< HEAD
     mutate(roll_mean = get_rollmean(sell_price)) %>%
     mutate(roll_mean = ifelse(is.na(roll_mean), sell_price, roll_mean)) %>%
+=======
+    mutate(roll_mean = rollmean(sell_price, 119, fill = NA, align = 'right')) %>%
+>>>>>>> 8e8c2d9ed217151f3d7fb574e12e80c0b336ba59
     mutate(promo = ifelse((sell_price - roll_mean)/roll_mean <= -0.02, 1, 0)) %>%
     mutate(hike = ifelse((sell_price - roll_mean)/roll_mean >= 0.02, 1, 0)) %>%
     mutate(sell_price_Lag_1 = lag(sell_price, 1)) %>%
@@ -458,7 +462,8 @@ models <- parallel::parLapply(cl, items_list, function(df) {
            promo,
            hike,
            Value,
-           Zero_Demand)
+           Zero_Demand) %>%
+    select(-promo)
   
   #################
   # Random forest #
@@ -571,22 +576,14 @@ models <- parallel::parLapply(cl, items_list, function(df) {
     spread(d, Prediction) %>%
     setNames(., nm = c("id", paste("F", 1:28, sep = "")))
   
-  return(out)
+  list(predictions = out,
+       rf_rsq = rf$r.squared) %>%
+    return()
 })
 
 end_time <- Sys.time()
 
 end_time - start_time
-
-map(models, function(m) {
-  m[['predictions']]
-}) %>%
-  bind_rows() %>%
-  write_csv("../eval_submission.csv")
-
-map_dbl(models, function(m) {
-  m[['rf_rsq']]
-})
 
 bind_rows(models) %>%
   write_csv("../eval_submission.csv")
