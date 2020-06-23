@@ -619,8 +619,8 @@ val_pred <- eval_pred %>%
 sample_sub <- read_csv("sample_submission.csv") %>%
   select(id)
 
-final_sub <- bind_cols(val_pred, eval_pred) %>%
+final_sub <- bind_rows(val_pred, eval_pred) %>%
   inner_join(sample_sub, ., by = "id")
 
 bind_rows(final_sub) %>%
-  write_csv("../eval_submission.csv")
+  write_csv("eval_submission.csv")
