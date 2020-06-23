@@ -604,10 +604,23 @@ end_time <- Sys.time()
 
 end_time - start_time
 
+################
+## Submission ##
+################
+
 eval_pred <- map(models, function(model) {
   model[['predictions']]
 }) %>%
   bind_rows()
 
-bind_rows(models) %>%
+val_pred <- eval_pred %>%
+  mutate(id = str_replace_all(id, "evaluation", "validation"))
+
+sample_sub <- read_csv("sample_submission.csv") %>%
+  select(id)
+
+final_sub <- bind_cols(val_pred, eval_pred) %>%
+  inner_join(sample_sub, ., by = "id")
+
+bind_rows(final_sub) %>%
   write_csv("../eval_submission.csv")
