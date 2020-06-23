@@ -88,7 +88,7 @@ ohe_calendar <- calendar %>%
 
 # future calendar dates
 future_calendar <- ohe_calendar %>%
-  filter(date >= "2016-05-21")
+  filter(date >= "2016-05-23")
 
 range(future_calendar$date)
 
@@ -249,13 +249,21 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   # no lead/lag indicators yet
   point_indicators <- df %>%
     mutate(released = ifelse(cumsum(Value > 0), 1, 0)) %>%
-    #select(-weekday, -month) %>%
-    inner_join(ohe_calendar, by = "date") %>%
-    inner_join(ohe_sports, by = "date") %>%
-    #left_join(prices, by = c("store_item", "wm_yr_wk")) %>%
+    left_join(ohe_calendar, by = "date") %>%
+    left_join(ohe_sports, by = "date") %>%
+    filter(date <= "2016-05-24") %>%
     select(-contains("NBAFinalsEnd"),
            -contains("NBAFinalsStart")) %>%
     drop_na()
+  
+  lead_ref <- ohe_calendar %>%
+    left_join(ohe_sports, by = "date") %>%
+    left_join(df, by = "date") %>%
+    mutate(released = ifelse(cumsum(Value > 0), 1, 0)) %>%
+    filter(date <= "2016-05-24", date >= "2016-05-23") %>%
+    select(-contains("NBAFinalsEnd"),
+           -contains("NBAFinalsStart")) %>%
+    select(colnames(point_indicators))
   
   #################################
   ## Calendar leading indicators ##
@@ -272,7 +280,10 @@ models <- parallel::parLapply(cl, items_list, function(df) {
            NBA_Finals,
            USO_Sunday,
            contains("Horse")) %>%
-    distinct()
+    distinct() 
+  
+  calendar_lead_vars <- calendar_lead_vars %>%
+    bind_rows(lead_ref %>% select(colnames(calendar_lead_vars)))
   
   # create leading indicators up to 2 days
   calendar_lead <- map(seq(1, 2, 1), function(val) {
@@ -282,7 +293,8 @@ models <- parallel::parLapply(cl, items_list, function(df) {
       mutate_all(list(lead_val)) %>%
       setNames(., nm = paste(names(.), "Lead", val, sep = "_"))
   }) %>%
-    bind_cols(calendar_lead_vars, .)
+    bind_cols(calendar_lead_vars, .) %>%
+    drop_na()
   
   # future leads
   future_lead_vars <- future_calendar %>%
@@ -331,6 +343,7 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   # point indicators with no lead/lag component
   calendar_fixed <- point_indicators %>%
     select(date,
+           #contains("snap"),
            contains("weekday"),
            contains("month"),
            contains("year"),
@@ -357,7 +370,7 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   ###############
   
   # get state SNAP indicators
-  item_snap <- df %>%
+  item_snap <- point_indicators %>%
     select(date, contains("snap")) %>%
     select(date, contains(item_state))
   
@@ -380,12 +393,8 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   
   # point price with lag-1
   item_prices <- df %>%
-<<<<<<< HEAD
     mutate(roll_mean = get_rollmean(sell_price)) %>%
     mutate(roll_mean = ifelse(is.na(roll_mean), sell_price, roll_mean)) %>%
-=======
-    mutate(roll_mean = rollmean(sell_price, 119, fill = NA, align = 'right')) %>%
->>>>>>> 8e8c2d9ed217151f3d7fb574e12e80c0b336ba59
     mutate(promo = ifelse((sell_price - roll_mean)/roll_mean <= -0.02, 1, 0)) %>%
     mutate(hike = ifelse((sell_price - roll_mean)/roll_mean >= 0.02, 1, 0)) %>%
     mutate(sell_price_Lag_1 = lag(sell_price, 1)) %>%
@@ -405,18 +414,18 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   # moving stats backshifted by 30 days to enable 30-day forecasts
   item_rolling <- df %>%
     select(date, Value) %>%
-    mutate(Roll_Median_30 = zoo::rollmedian(Value, 29, align = 'right', fill = NA)) %>%
-    mutate(Roll_Median_7 = zoo::rollmedian(Value, 7, align = 'right', fill = NA)) %>%
-    mutate(Roll_Median_14 = zoo::rollmedian(Value, 13, align = 'right', fill = NA)) %>%
-    mutate(Roll_Median_30_Shift = lag(Roll_Median_30, 29)) %>%
-    mutate(Roll_Median_7_Shift = lag(Roll_Median_7, 29)) %>%
-    mutate(Roll_Median_14_Shift = lag(Roll_Median_14, 29)) %>%
-    mutate(Roll_Sd_30 = zoo::rollapply(Value, 30, sd, align = 'right', fill = NA)) %>%
+    mutate(Roll_Mean_28 = zoo::rollmean(Value, 28, align = 'right', fill = NA)) %>%
+    mutate(Roll_Mean_7 = zoo::rollmean(Value, 7, align = 'right', fill = NA)) %>%
+    mutate(Roll_Mean_14 = zoo::rollmean(Value, 14, align = 'right', fill = NA)) %>%
+    mutate(Roll_Mean_28_Shift = lag(Roll_Mean_28, 28)) %>%
+    mutate(Roll_Mean_7_Shift = lag(Roll_Mean_7, 28)) %>%
+    mutate(Roll_Mean_14_Shift = lag(Roll_Mean_14, 28)) %>%
+    mutate(Roll_Sd_28 = zoo::rollapply(Value, 28, sd, align = 'right', fill = NA)) %>%
     mutate(Roll_Sd_7 = zoo::rollapply(Value, 7, sd, align = 'right', fill = NA)) %>%
     mutate(Roll_Sd_14 = zoo::rollapply(Value, 14, sd, align = 'right', fill = NA)) %>%
-    mutate(Roll_Sd_30_Shift = lag(Roll_Sd_30, 30)) %>%
-    mutate(Roll_Sd_7_Shift = lag(Roll_Sd_7, 30)) %>%
-    mutate(Roll_Sd_14_Shift = lag(Roll_Sd_14, 30)) %>%
+    mutate(Roll_Sd_28_Shift = lag(Roll_Sd_28, 28)) %>%
+    mutate(Roll_Sd_7_Shift = lag(Roll_Sd_7, 28)) %>%
+    mutate(Roll_Sd_14_Shift = lag(Roll_Sd_14, 28)) %>%
     select(date, 
            contains("Shift"))
   
@@ -427,7 +436,7 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   # combine prices, SNAP, rolling stats, holidays, dates, leads, lags
   # extra indicator for zero demand
   model_tbl <- df %>%
-    select(-contains("snap")) %>%
+    #select(-contains("snap")) %>%
     inner_join(item_prices, by = "date") %>%
     inner_join(item_snap, by = "date") %>%
     inner_join(item_rolling, by = "date") %>%
@@ -462,15 +471,17 @@ models <- parallel::parLapply(cl, items_list, function(df) {
            promo,
            hike,
            Value,
-           Zero_Demand) %>%
-    select(-promo)
+           Zero_Demand)
   
   #################
   # Random forest #
   #################
   
   # fit
-  mtry <- ncol(train)-2
+  mtry <-  train %>% 
+    select(-date, -Value) %>%
+    ncol()
+  
   rf <- ranger::ranger(
     formula = Value ~ .,
     data = train %>% select(-date),
@@ -478,6 +489,12 @@ models <- parallel::parLapply(cl, items_list, function(df) {
     mtry = mtry,
     num.trees = 500
   )
+  
+  rf_rmse <- sqrt(rf$prediction.error)
+  
+  rf_var_importance <- rf$variable.importance %>%
+    enframe() %>%
+    arrange(desc(value))
   
   #############
   ## XGBoost ##
@@ -495,7 +512,10 @@ models <- parallel::parLapply(cl, items_list, function(df) {
                  max.depth = 5,
                  early_stopping_rounds = 10,
                  objective = "reg:squarederror",
+                 eval_metric = "rmse",
                  verbose = F) 
+  
+  xgb_rmse <- xgb$best_score
   
   ############
   # Forecast #
@@ -504,14 +524,12 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   # future prices
   future_item_prices <- future_prices %>%
     semi_join(df, by = c("store_item")) %>%
-    select(date, 
-           sell_price) %>%
-    bind_rows(df %>% 
-                select(date, sell_price) %>%
-                tail(120)) %>%
+    select(date, sell_price) %>%
+    bind_rows(df %>% select(date, sell_price)) %>%
     distinct() %>%
     arrange(date) %>%
-    mutate(roll_mean = rollmean(sell_price, 119, fill = NA, align = 'right')) %>%
+    mutate(roll_mean = get_rollmean(sell_price)) %>%
+    mutate(roll_mean = ifelse(is.na(roll_mean), sell_price, roll_mean)) %>%
     mutate(promo = ifelse((sell_price - roll_mean)/roll_mean <= -0.02, 1, 0)) %>%
     mutate(hike = ifelse((sell_price - roll_mean)/roll_mean >= 0.02, 1, 0)) %>%
     semi_join(future_prices, by = "date")
@@ -531,16 +549,15 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   future_rolling <- df %>%
     arrange(date) %>%
     tail(60) %>%
-    mutate(Roll_Median_30_Shift = zoo::rollmedian(Value, 29, align = 'right', fill = NA)) %>%
-    mutate(Roll_Median_7_Shift = zoo::rollmedian(Value, 7, align = 'right', fill = NA)) %>%
-    mutate(Roll_Median_14_Shift = zoo::rollmedian(Value, 13, align = 'right', fill = NA)) %>%
-    mutate(Roll_Sd_30_Shift = zoo::rollapply(Value, 30, sd, align = 'right', fill = NA)) %>%
+    mutate(Roll_Mean_28_Shift = zoo::rollmean(Value, 28, align = 'right', fill = NA)) %>%
+    mutate(Roll_Mean_7_Shift = zoo::rollmean(Value, 7, align = 'right', fill = NA)) %>%
+    mutate(Roll_Mean_14_Shift = zoo::rollmean(Value, 14, align = 'right', fill = NA)) %>%
+    mutate(Roll_Sd_28_Shift = zoo::rollapply(Value, 28, sd, align = 'right', fill = NA)) %>%
     mutate(Roll_Sd_7_Shift = zoo::rollapply(Value, 7, sd, align = 'right', fill = NA)) %>%
     mutate(Roll_Sd_14_Shift = zoo::rollapply(Value, 14, sd, align = 'right', fill = NA)) %>%
-    select(date, 
-           Roll_Median_30_Shift:Roll_Sd_14_Shift) %>%
+    select(date, Roll_Mean_28_Shift:Roll_Sd_14_Shift) %>%
     drop_na() %>%
-    mutate(date = date + months(1))
+    mutate(date = date + days(28))
   
   # future modeling table
   future_model_tbl <- future_calendar %>%
@@ -577,7 +594,9 @@ models <- parallel::parLapply(cl, items_list, function(df) {
     setNames(., nm = c("id", paste("F", 1:28, sep = "")))
   
   list(predictions = out,
-       rf_rsq = rf$r.squared) %>%
+       rf_rmse = rf_rmse,
+       xgb_rmse = xgb_rmse,
+       rf_var_importance = rf_var_importance) %>%
     return()
 })
 
@@ -585,6 +604,10 @@ end_time <- Sys.time()
 
 end_time - start_time
 
+eval_pred <- map(models, function(model) {
+  model[['predictions']]
+}) %>%
+  bind_rows()
+
 bind_rows(models) %>%
   write_csv("../eval_submission.csv")
-
