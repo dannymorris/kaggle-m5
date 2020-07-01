@@ -2,27 +2,28 @@
 
 ## Run this on EC2 using RStudio AMI
 
+
 library(tidyverse)
 library(recipes) 
-library(mlbgameday)
-library(nbastatR)
+#library(mlbgameday)
+#library(nbastatR)
 library(lubridate)
 library(zoo)
-library(h2o)
 library(ranger)
+#library(h2o)
 library(parallel)
 
 # calendar reference
-calendar <- read_csv("calendar.csv")
+calendar <- read_csv("data/calendar.csv")
 
 # prices
-prices <- read_csv("sell_prices.csv") %>%
+prices <- read_csv("data/sell_prices.csv") %>%
   mutate(store_item = paste(item_id, store_id, sep = "_")) %>%
   select(-item_id,
          -store_id)
 
 # training set
-sample_df <- read_csv("sales_train_evaluation.csv") %>%
+sample_df <- read_csv("data/sales_train_evaluation.csv") %>%
   mutate(store_item = paste(item_id, store_id, sep = "_")) %>%
   gather(Date, Value, -id:-state_id, -store_item) %>%
   inner_join(calendar, by = c("Date" = "d")) %>%
@@ -88,8 +89,6 @@ range(future_calendar$date)
 # Prices #
 ##########
 
-#prices <- read_csv("sell_prices.csv")
-
 future_prices <- prices %>%
   inner_join(future_calendar %>%
                select(date, wm_yr_wk), 
@@ -116,44 +115,19 @@ football <- calendar %>%
 #   filter(Month == 6) %>%
 #   select(date = dateGame) %>%
 #   mutate(NBA_Finals = 1)
-nba_finals <- read_csv("nba_finals.csv")
+nba_finals <- read_csv("data/nba_finals.csv")
 
 # US Open (Sundays)
-us_open <- read_csv("us_open.csv") %>%
+us_open <- read_csv("data/us_open.csv") %>%
   mutate(date = lubridate::mdy(date)) %>%
   mutate(USO_Sunday = 1) %>%
   select(-event)
 
 # MLB schedule for teams in WI, CA, and TX
-teams <- tibble::tribble(
-  ~team, ~state_id,
-  "Brewers", "WI",
-  "Angels", "CA",
-  "Padres", "CA",
-  "Athletics", "CA",
-  "Giants", "CA",
-  "Dodgers", "CA",
-  "Astros", "TX",
-  "Rangers", "TX"
-)
-
-mlb <- mlbgameday::game_ids %>% 
-  as_tibble() %>%
-  mutate(date = as.Date(date_dt)) %>%
-  select(date, home_team_name, away_team_name) %>%
-  gather(home_away, team, -date) %>%
-  inner_join(teams, by = "team") %>%
-  filter(date >= "2011-01-01", date <= "2016-07-01") %>%
-  group_by(date, state_id, home_away) %>%
-  count() %>%
-  mutate(home_away_state = paste("MLB", substr(home_away, 1, 4), state_id, sep = "_")) %>%
-  ungroup() %>%
-  select(-home_away, -state_id) %>%
-  spread(home_away_state, n) %>%
-  replace(is.na(.), 0)
+mlb <- read_csv('data/mlb_games.csv')
 
 # Horse racing (triple crown)
-horse_race <- read_csv("horse_racing.csv") %>%
+horse_race <- read_csv("data/horse_racing.csv") %>%
   mutate(date = lubridate::mdy(date)) %>%
   mutate(Horse_Race = 1) %>%
   spread(event, Horse_Race, fill = 0)
@@ -209,6 +183,7 @@ gc()
 ###########
 
 n_cores <- parallel::detectCores()-1
+n_cores
 cl <- makeCluster(n_cores)
 clusterExport(cl, c("ohe_calendar",
                     "future_calendar",
@@ -225,8 +200,11 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   library(tidyverse)
   library(lubridate)
   library(zoo)
-  library(xgboost)
   library(ranger)
+  
+  ####################
+  # Item indicators #
+  ####################
   
   # item ids
   item_state <- unique(df$state_id)
@@ -240,10 +218,9 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   # combine daily calendar, sports, prices data
   # no lead/lag indicators yet
   point_indicators <- df %>%
-    mutate(released = ifelse(cumsum(Value > 0), 1, 0)) %>%
     left_join(ohe_calendar, by = "date") %>%
     left_join(ohe_sports, by = "date") %>%
-    filter(date <= "2016-05-24") %>%
+    #filter(date <= "2016-06-21") %>%
     select(-contains("NBAFinalsEnd"),
            -contains("NBAFinalsStart")) %>%
     drop_na()
@@ -251,7 +228,6 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   lead_ref <- ohe_calendar %>%
     left_join(ohe_sports, by = "date") %>%
     left_join(df, by = "date") %>%
-    mutate(released = ifelse(cumsum(Value > 0), 1, 0)) %>%
     filter(date <= "2016-05-24", date >= "2016-05-23") %>%
     select(-contains("NBAFinalsEnd"),
            -contains("NBAFinalsStart")) %>%
@@ -401,6 +377,10 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   # Rolling sales metrics #
   #########################
   
+  calc_trend <- function(x) {
+    lm(x ~ seq_along(x))$coefficients[2]
+  }
+  
   # moving medians (7, 14, and 30 day)
   # moving standard devs (7, 14, and 30 day)
   # moving stats backshifted by 30 days to enable 30-day forecasts
@@ -418,6 +398,12 @@ models <- parallel::parLapply(cl, items_list, function(df) {
     mutate(Roll_Sd_28_Shift = lag(Roll_Sd_28, 28)) %>%
     mutate(Roll_Sd_7_Shift = lag(Roll_Sd_7, 28)) %>%
     mutate(Roll_Sd_14_Shift = lag(Roll_Sd_14, 28)) %>%
+    mutate(Roll_Lm_28 = zoo::rollapply(Value, 28, calc_trend, align = 'right', fill = NA)) %>%
+    mutate(Roll_Lm_14 = zoo::rollapply(Value, 14, calc_trend, align = 'right', fill = NA)) %>%
+    mutate(Roll_Lm_7 = zoo::rollapply(Value, 7, calc_trend, align = 'right', fill = NA)) %>%
+    mutate(Roll_Lm_28_Shift = lag(Roll_Lm_28, 28)) %>%
+    mutate(Roll_Lm_14_Shift = lag(Roll_Lm_14, 14)) %>%
+    mutate(Roll_Lm_7_Shift = lag(Roll_Lm_7, 7)) %>%
     select(date, 
            contains("Shift"))
   
@@ -437,13 +423,6 @@ models <- parallel::parLapply(cl, items_list, function(df) {
     inner_join(item_mlb_state, by = "date") %>%
     inner_join(calendar_lag, by = "date") %>%
     inner_join(calendar_fixed, by = "date") %>%
-    mutate(Zero_Demand = ifelse(Value == 0, 1, 0))
-  
-  #################
-  # Training data #
-  #################
-  
-  train <- model_tbl %>% 
     drop_na() %>%
     select(date,
            contains("year"),
@@ -462,52 +441,28 @@ models <- parallel::parLapply(cl, items_list, function(df) {
            sell_price,
            promo,
            hike,
-           Value,
-           Zero_Demand)
+           Value) 
   
   #################
-  # Random forest #
+  # Training data #
   #################
+
+  train <- model_tbl %>%
+    filter(date >= "2012-01-01") 
   
-  # fit
-  mtry <-  train %>% 
-    select(-date, -Value) %>%
-    ncol()
+  range(train$date)
   
+  #################
+  # Random Forest #
+  #################
+  # 
   rf <- ranger::ranger(
     formula = Value ~ .,
     data = train %>% select(-date),
     importance = 'impurity',
-    mtry = mtry,
-    num.trees = 500
+    #mtry = round(ncol(train)*.33),
+    num.trees = 1000
   )
-  
-  rf_rmse <- sqrt(rf$prediction.error)
-  
-  rf_var_importance <- rf$variable.importance %>%
-    enframe() %>%
-    arrange(desc(value))
-  
-  #############
-  ## XGBoost ##
-  #############
-  
-  train_mat <- train %>% 
-    select(-Value, -date) %>% 
-    as.matrix()
-  
-  xgb <- xgboost(data = train_mat, 
-                 label = as.matrix(train$Value), 
-                 eta = 0.1, 
-                 nthread = 2, 
-                 nrounds = 100, 
-                 max.depth = 5,
-                 early_stopping_rounds = 10,
-                 objective = "reg:squarederror",
-                 eval_metric = "rmse",
-                 verbose = F) 
-  
-  xgb_rmse <- xgb$best_score
   
   ############
   # Forecast #
@@ -547,13 +502,20 @@ models <- parallel::parLapply(cl, items_list, function(df) {
     mutate(Roll_Sd_28_Shift = zoo::rollapply(Value, 28, sd, align = 'right', fill = NA)) %>%
     mutate(Roll_Sd_7_Shift = zoo::rollapply(Value, 7, sd, align = 'right', fill = NA)) %>%
     mutate(Roll_Sd_14_Shift = zoo::rollapply(Value, 14, sd, align = 'right', fill = NA)) %>%
-    select(date, Roll_Mean_28_Shift:Roll_Sd_14_Shift) %>%
+    mutate(Roll_Lm_28_Shift = zoo::rollapply(Value, 28, calc_trend, align = 'right', fill = NA)) %>%
+    mutate(Roll_Lm_14_Shift = zoo::rollapply(Value, 14, calc_trend, align = 'right', fill = NA)) %>%
+    mutate(Roll_Lm_7_Shift = zoo::rollapply(Value, 7, calc_trend, align = 'right', fill = NA)) %>%
+    select(date, Roll_Mean_28_Shift:Roll_Lm_7_Shift) %>%
     drop_na() %>%
     mutate(date = date + days(28))
   
   # future modeling table
   future_model_tbl <- future_calendar %>%
     select(date) %>%
+    mutate(dept_id = unique(df$dept_id),
+           cat_id = unique(df$cat_id),
+           store_id = unique(df$store_id),
+           state_id = unique(df$state_id)) %>%
     inner_join(future_item_prices %>% select(date, hike, promo), by = "date") %>%
     inner_join(future_rolling, by = "date") %>%
     inner_join(future_lead_tbls, by = "date") %>%
@@ -563,19 +525,11 @@ models <- parallel::parLapply(cl, items_list, function(df) {
     mutate(Zero_Demand = 0) %>%
     replace(is.na(.), 0)
   
-  future_xgb_mat <- future_model_tbl %>%
-    select(which(colnames(future_model_tbl) %in% colnames(train))) %>%
-    select(-date) %>%
-    select(colnames(train_mat)) %>%
-    as.matrix()
-  
   rf_fcast <- predict(rf, data = future_model_tbl)$predictions
-  xgb_fcast <- predict(xgb, newdata = future_xgb_mat)
-  ens_fcast <- (rf_fcast + xgb_fcast)/2
   
   out <- future_model_tbl %>%
     select(date) %>%
-    mutate(Prediction = ens_fcast) %>%
+    mutate(Prediction = rf_fcast) %>%
     mutate(Prediction = ifelse(Prediction < 0, 0, Prediction)) %>%
     mutate(id = paste(item_ID, store_ID, "evaluation", sep = "_")) %>%
     inner_join(future_calendar %>%
@@ -585,11 +539,7 @@ models <- parallel::parLapply(cl, items_list, function(df) {
     spread(d, Prediction) %>%
     setNames(., nm = c("id", paste("F", 1:28, sep = "")))
   
-  list(predictions = out,
-       rf_rmse = rf_rmse,
-       xgb_rmse = xgb_rmse,
-       rf_var_importance = rf_var_importance) %>%
-    return()
+  return(out)
 })
 
 end_time <- Sys.time()
@@ -600,15 +550,12 @@ end_time - start_time
 ## Submission ##
 ################
 
-eval_pred <- map(models, function(model) {
-  model[['predictions']]
-}) %>%
-  bind_rows()
+eval_pred <- bind_rows(models)
 
 val_pred <- eval_pred %>%
   mutate(id = str_replace_all(id, "evaluation", "validation"))
 
-sample_sub <- read_csv("sample_submission.csv") %>%
+sample_sub <- read_csv("data/sample_submission.csv") %>%
   select(id)
 
 final_sub <- bind_rows(val_pred, eval_pred) %>%

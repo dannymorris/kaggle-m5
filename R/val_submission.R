@@ -23,7 +23,7 @@ prices <- read_csv("data/sell_prices.csv") %>%
          -store_id)
 
 # training set
-sample_df <- read_csv("data/sales_train_validation.csv") %>%
+sample_df <- read_csv("data/sales_train_evaluation.csv") %>%
   mutate(store_item = paste(item_id, store_id, sep = "_")) %>%
   gather(Date, Value, -id:-state_id, -store_item) %>%
   inner_join(calendar, by = c("Date" = "d")) %>%
