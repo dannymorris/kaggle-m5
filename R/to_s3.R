@@ -2,15 +2,25 @@
 
 ## Run this on EC2 using RStudio AMI
 
+install.packages("recipes")
+install.packages("zoo")
+install.packages("data.table")
+install.packages("aws.s3", repos = "https://cloud.R-project.org")
+
+Sys.setenv("AWS_ACCESS_KEY_ID" = "AKIAI7MMCIQPQHNRG7HQ",
+           "AWS_SECRET_ACCESS_KEY" = "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",
+           "AWS_DEFAULT_REGION" = "us-east-1")
+
 
 library(tidyverse)
 library(recipes) 
 library(lubridate)
 library(zoo)
-library(h2o)
 library(parallel)
-library(furrr)
 library(data.table)
+
+
+setwd("~/kaggle-m5")
 
 # calendar reference
 calendar <- read_csv("data/calendar.csv")
@@ -22,8 +32,10 @@ prices <- read_csv("data/sell_prices.csv") %>%
          -store_id)
 
 # training set
-sample_df <- read_csv("data/sales_train_evaluation.csv") %>%
-  mutate(store_item = paste(item_id, store_id, sep = "_")) %>%
+eval_df <- read_csv("data/sales_train_evaluation.csv") %>%
+  mutate(store_item = paste(item_id, store_id, sep = "_"))
+
+sample_df <- eval_df %>%
   gather(Date, Value, -id:-state_id, -store_item) %>%
   inner_join(calendar, by = c("Date" = "d")) %>%
   left_join(prices, by = c("store_item", "wm_yr_wk")) %>%
@@ -43,6 +55,24 @@ sample_df <- read_csv("data/sales_train_evaluation.csv") %>%
 
 range(sample_df$date)
 
+###########
+## Items ##
+###########
+
+label_enc <- function(x) {
+  as.numeric(x)-1
+}
+
+item_ohe <- eval_df %>%
+  select(store_item, item_id, dept_id, cat_id, store_id, state_id) %>%
+  mutate_at(vars(-store_item),as.factor) %>%
+  mutate_at(vars(-store_item),label_enc)
+# mutate(item_id = as.numeric(item_id)-1) %>%
+# recipes::recipe(~., data = .) %>%
+# step_dummy(all_predictors(), -store_item, -item_id, one_hot = T) %>%
+# prep() %>%
+# juice()
+
 ##############
 ## Calendar ##
 ##############
@@ -52,11 +82,8 @@ range(sample_df$date)
 ohe_date <- calendar %>%
   mutate(weekmonth = stringi::stri_datetime_fields(date)$WeekOfMonth) %>%
   select(weekday, weekmonth, month, year) %>%
-  mutate_at(vars(weekmonth, month, year), as.factor) %>%
-  recipes::recipe(~., data = .) %>%
-  step_dummy(all_predictors(), one_hot = T) %>%
-  prep() %>%
-  juice()
+  mutate_all(as.factor) %>%
+  mutate_all(label_enc)
 
 # one-hot encode holidays
 ohe_holidays <- calendar %>%
@@ -73,7 +100,7 @@ ohe_holidays <- calendar %>%
 
 # combine OHE dates and holidays
 ohe_calendar <- calendar %>%
-  select(-contains("event"), -wday,  -year) %>%
+  select(date, d, wm_yr_wk, contains("snap")) %>%
   bind_cols(ohe_date) %>%
   left_join(ohe_holidays, by = "date") %>%
   replace(is.na(.), 0)
@@ -160,67 +187,51 @@ range(future_sports_df$date)
 # separate all items using list
 # modeling will use split-apply-combine method
 items_list <- sample_df %>%
+  select(id, store_item, wm_yr_wk, date, Value) %>%
   inner_join(prices, by = c("store_item", "wm_yr_wk")) %>%
-  select(id,
-         store_item,
-         item_id,
-         dept_id,
-         cat_id,
-         store_id,
-         state_id,
-         date,
-         wm_yr_wk,
-         contains("snap"),
-         sell_price,
-         Value) %>%
-  split(., .$store_item)
+  inner_join(item_ohe, by = "store_item") %>%
+  # select(id,
+  #        store_item,
+  #        # item_id,
+  #        # dept_id,
+  #        # cat_id,
+  #        # store_id,
+  #        # state_id,
+  #        colnames(item_ohe),
+  #        date,
+  #        wm_yr_wk,
+  #        contains("snap"),
+#        sell_price,
+#        Value) %>%
+split(., .$store_item)
 
 rm(sample_df)
 rm(prices)
 gc()
 
-ports <- rep(1:200, length(items_list))[1:length(items_list)]
-
-items_list <- map2(items_list, ports, function(df, port) {
-  df[, "port"] <- port
-  return(df)
-})
-
 ###########
 ## Model ##
 ###########
 
-n_cores <- parallel::detectCores()-1
+n_cores <- parallel::detectCores()-4
 n_cores
 cl <- makeCluster(n_cores)
 clusterExport(cl, c("ohe_calendar",
                     "future_calendar",
                     "ohe_sports",
                     "future_sports_df",
-                    "future_prices",
-                    "ports"))
+                    "future_prices"))
 
 start_time <- Sys.time()
 
 #df <- items_list[[31]]
 
-models <- parallel::parLapply(cl, items_list, function(df) {
+item_tbls <- parallel::parLapply(cl, items_list, function(df) {
   
   library(tidyverse)
   library(lubridate)
   library(zoo)
-  #library(h2o)
-  # 
 
-  ####################
-  # Item indicators #
-  ####################
-  
-  # item ids
-  item_state <- unique(df$state_id)
-  item_ID <- unique(df$item_id)
-  store_ID <- unique(df$store_id)
-  
   ######################################
   ## Sales data with point indicators ##
   ######################################
@@ -321,14 +332,11 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   # point indicators with no lead/lag component
   calendar_fixed <- point_indicators %>%
     select(date,
-           #contains("snap"),
            contains("weekday"),
            contains("month"),
            contains("year"),
            contains("weekmonth"),
-           -contains("event"),
-           -weekday,
-           -month) %>%
+           -contains("event")) %>%
     distinct()
   
   # future fixed
@@ -339,9 +347,7 @@ models <- parallel::parLapply(cl, items_list, function(df) {
            contains("month"),
            contains("year"),
            contains("weekmonth"),
-           -contains("event"),
-           -weekday,
-           -month)
+           -contains("event"))
   
   ###############
   # subset SNAP #
@@ -422,20 +428,25 @@ models <- parallel::parLapply(cl, items_list, function(df) {
     inner_join(calendar_fixed, by = "date") %>%
     drop_na() %>%
     select(date,
-           id:state_id,
-           contains("year"),
-           contains("month"),
-           contains("weekday"),
-           contains("weekmonth"),
-           contains("snap"),
-           contains("NFL"),
-           contains("NBA"),
-           contains("NCAA"),
-           contains("USO"),
-           contains("MLB"),
-           contains("Horse"),
-           contains("event"),
-           contains("Roll"),
+           id,
+           store_item,
+           dept_id,
+           cat_id,
+           store_id,
+           state_id,
+           contains("snap_"),
+           contains("year_"),
+           contains("month_"),
+           contains("weekday_"),
+           contains("weekmonth_"),
+           contains("NFL_"),
+           contains("NBA_"),
+           contains("NCAA_"),
+           contains("USO_"),
+           contains("MLB_"),
+           contains("Horse_"),
+           contains("event_"),
+           contains("Roll_"),
            sell_price,
            promo,
            hike,
@@ -508,18 +519,60 @@ models <- parallel::parLapply(cl, items_list, function(df) {
     select(colnames(model_tbl %>% select(-Value))) %>%
     replace(is.na(.), 0) 
   
-  # h2o.init(nthreads = 1, port = 54321+unique(df$port))
-  # h2o.stopLogging()
-  # h2o.no_progress()
+  train <- model_tbl %>% 
+    select(-date, -id, -store_item) %>%
+    select(Value, everything())
   
-  out <- bind_rows(
-    model_tbl %>% mutate(Split = "Train"),
-    future_model_tbl %>% mutate(Split = "Eval")
-  ) 
-    #h2o::as.h2o()
-    #data.table::as.data.table()
+  eval <- future_model_tbl %>%
+    select(-date, -id, -store_item) %>%
+    select(everything())
   
-  # h2o.shutdown()
+  eval_meta <- future_model_tbl %>%
+    select(date, id, store_id)
+  
+  file_id <- unique(df$id)
+  train_file_name <- paste("walmart_items/train/", file_id, ".csv", sep = "")
+  eval_file_name <- paste("walmart_items/eval/", file_id, ".csv", sep = "")
+  eval_meta_file_name <- paste("walmart_items/eval_meta/", file_id, ".csv", sep = "")
+  
+  out <- list(
+    train = train,
+    eval = eval,
+    eval_meta = eval_meta,
+    store_id = unique(df$store_id)
+  )
+  
+  
+  # aws.s3::s3write_using(
+  #   x = train,
+  #   FUN = write_csv,
+  #   object = train_file_name,
+  #   bucket = "abn-distro"
+  # )
+  # 
+  # aws.s3::s3write_using(
+  #   x = eval,
+  #   FUN = write_csv,
+  #   object = eval_file_name,
+  #   bucket = "abn-distro"
+  # )
+  #  
+  # aws.s3::s3write_using(
+  #   x = eval_meta,
+  #   FUN = write_csv,
+  #   object = eval_meta_file_name,
+  #   bucket = "abn-distro"
+  # )
+  
+  #Sys.sleep(2)
+  
+  tt <- aws.s3::get_bucket_df(
+    bucket = "abn-distro",
+    prefix = "m5_store_items/eval/",
+    max = Inf
+  )
+
+  dim(tt)
   
   rm(calendar_fixed)
   rm(calendar_lag)
@@ -528,94 +581,58 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   rm(train)
   
   return(out)
+
 })
 
-dt1 <- bind_rows(models)
-dt2 <- data.table::rbindlist(models[10001:20000])
-dt3 <- data.table::rbindlist(models[20001:30490])
-
-
-#model_list <- data.table::rbindlist(models)
-#h2o_df <- h2o.rbind(models)
-
-rm(models)
+stopCluster(cl)
+rm(cl)
 gc()
 
-h2o.shutdown()
-h2o.init(nthreads = -1, min_mem_size = "280G")
+n_cores <- parallel::detectCores()-4
+n_cores
+cl <- makeCluster(n_cores, type = "MPI")
+# clusterExport(cl, c("ohe_calendar",
+#                     "future_calendar",
+#                     "ohe_sports",
+#                     "future_sports_df",
+#                     "future_prices"))
 
-model_df <- h2o::as.h2o(dt1)
+# load training to s3
+parallel::parLapply(cl, item_tbls, function(item) {
+  train <- item[['train']]
+  file_id <- unique(item[['eval_meta']]$id)
+  file_name <- paste("m5_store_items/train/", file_id, ".csv", sep = "")
+  #write_csv(train, file_name)
+  aws.s3::s3write_using(
+    x = train,
+    FUN = readr::write_csv,
+    object = file_name,
+    bucket = "abn-distro"
+  )
+})
 
-#rm(items_list)
+# load eval to s3
+parallel::parLapply(cl, item_tbls, function(item) {
+  eval <- item[['eval']]
+  file_id <- unique(item[['eval_meta']]$id)
+  file_name <- paste("m5_store_items/eval/", file_id, ".csv", sep = "")
+  aws.s3::s3write_using(
+    x = eval,
+    FUN = data.table::fwrite,
+    object = file_name,
+    bucket = "abn-distro"
+  )
+})
 
-end_time <- Sys.time()
-
-end_time - start_time
-
-
-#########
-## H2O ##
-#########
-
-model_df <- h2o.rbind(models)
-
-train <- model_df[model_df$Split == "Train",]
-train[, c(2,3,4,5,6,7,8)] <- as.factor(train[, c(2,3,4,5,6,7,8)])
-
-eval <- model_df[model_df$Split == "Eval",]
-eval[, c(2,3,4,5,6,7,8)] <- as.factor(eval[, c(2,3,4,5,6,7,8)])
-
-rm(dt1)
-gc()
-
-#h2o.init(nthreads = 46)
-
-ignore_features <- which(colnames(train) %in% c("date", "Value", "id", "store_item"))
-features <- colnames(train)[-ignore_features]
-y <- "Value"
-
-fit <- h2o.gbm(x = features,
-               y = y,
-               training_frame = train,
-               ntrees = 2000,
-               learn_rate = 0.05,
-               learn_rate_annealing = 0.99,
-               col_sample_rate = 0.67,
-               sample_rate = 0.67,
-               stopping_rounds = 0,
-               categorical_encoding = "Enum",
-               distribution = "tweedie")
-
-# function to return vector of predictions from H2O fitted models.
-predict_h2o <- function(m, test_df) {
-  test_df %>%
-    as.h2o() %>%
-    predict(m, newdata = .) %>%
-    as.vector()
-}
-
-fcast <- predict_h2o(fit, test_df = eval)
-
-eval[, "Value"] <- fcast
-
-
-################
-## Submission ##
-################
-
-eval_pred <- eval %>%
-  select(date, id, Value) %>%
-  spread(date, Value) %>%
-  setNames(., nm = c("id", paste("F", 1:28, sep = "")))
-
-val_pred <- eval_pred %>%
-  mutate(id = str_replace_all(id, "evaluation", "validation"))
-
-sample_sub <- read_csv("data/sample_submission.csv") %>%
-  select(id)
-
-final_sub <- bind_rows(val_pred, eval_pred) %>%
-  inner_join(sample_sub, ., by = "id")
-
-bind_rows(final_sub) %>%
-  write_csv("eval_submission.csv")
+# load eval meta to s3
+parallel::parLapply(cl, item_tbls, function(item) {
+  eval_meta <- item[['eval_meta']]
+  file_id <- unique(item[['eval_meta']]$id)
+  file_name <- paste("m5_store_items/eval_meta/", file_id, ".csv", sep = "")
+  aws.s3::s3write_using(
+    x = eval_meta,
+    FUN = data.table::fwrite,
+    object = file_name,
+    bucket = "abn-distro"
+  )
+})
