@@ -5,13 +5,12 @@
 
 library(tidyverse)
 library(recipes) 
-#library(mlbgameday)
-#library(nbastatR)
 library(lubridate)
 library(zoo)
-#library(ranger)
 library(h2o)
 library(parallel)
+library(furrr)
+library(data.table)
 
 # calendar reference
 calendar <- read_csv("data/calendar.csv")
@@ -84,6 +83,7 @@ future_calendar <- ohe_calendar %>%
   filter(date >= "2016-05-23")
 
 range(future_calendar$date)
+
 
 ##########
 # Prices #
@@ -176,7 +176,15 @@ items_list <- sample_df %>%
   split(., .$store_item)
 
 rm(sample_df)
+rm(prices)
 gc()
+
+ports <- rep(1:200, length(items_list))[1:length(items_list)]
+
+items_list <- map2(items_list, ports, function(df, port) {
+  df[, "port"] <- port
+  return(df)
+})
 
 ###########
 ## Model ##
@@ -189,7 +197,8 @@ clusterExport(cl, c("ohe_calendar",
                     "future_calendar",
                     "ohe_sports",
                     "future_sports_df",
-                    "future_prices"))
+                    "future_prices",
+                    "ports"))
 
 start_time <- Sys.time()
 
@@ -200,8 +209,9 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   library(tidyverse)
   library(lubridate)
   library(zoo)
-  library(ranger)
-  
+  #library(h2o)
+  # 
+
   ####################
   # Item indicators #
   ####################
@@ -339,8 +349,7 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   
   # get state SNAP indicators
   item_snap <- point_indicators %>%
-    select(date, contains("snap")) %>%
-    select(date, contains(item_state))
+    select(date, contains("snap")) 
   
   ##############
   # subset MLB #
@@ -348,8 +357,7 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   
   # get MLB games in item state
   item_mlb_state <- calendar_lead %>%
-    select(date, contains("MLB")) %>%
-    select(date, contains(item_state))
+    select(date, contains("MLB"))
   
   ###############
   # Item prices #
@@ -369,17 +377,12 @@ models <- parallel::parLapply(cl, items_list, function(df) {
     mutate(sell_price_diff = sell_price - lag(sell_price, 1)) %>%
     mutate(sell_price_change = ((lag(sell_price) - sell_price)/sell_price)) %>%
     select(date,
-           sell_price_Lag_1,
            promo,
            hike)
   
   #########################
   # Rolling sales metrics #
   #########################
-  
-  calc_trend <- function(x) {
-    lm(x ~ seq_along(x))$coefficients[2]
-  }
   
   # moving medians (7, 14, and 30 day)
   # moving standard devs (7, 14, and 30 day)
@@ -398,12 +401,6 @@ models <- parallel::parLapply(cl, items_list, function(df) {
     mutate(Roll_Sd_28_Shift = lag(Roll_Sd_28, 28)) %>%
     mutate(Roll_Sd_7_Shift = lag(Roll_Sd_7, 28)) %>%
     mutate(Roll_Sd_14_Shift = lag(Roll_Sd_14, 28)) %>%
-    mutate(Roll_Lm_28 = zoo::rollapply(Value, 28, calc_trend, align = 'right', fill = NA)) %>%
-    mutate(Roll_Lm_14 = zoo::rollapply(Value, 14, calc_trend, align = 'right', fill = NA)) %>%
-    mutate(Roll_Lm_7 = zoo::rollapply(Value, 7, calc_trend, align = 'right', fill = NA)) %>%
-    mutate(Roll_Lm_28_Shift = lag(Roll_Lm_28, 28)) %>%
-    mutate(Roll_Lm_14_Shift = lag(Roll_Lm_14, 14)) %>%
-    mutate(Roll_Lm_7_Shift = lag(Roll_Lm_7, 7)) %>%
     select(date, 
            contains("Shift"))
   
@@ -425,6 +422,7 @@ models <- parallel::parLapply(cl, items_list, function(df) {
     inner_join(calendar_fixed, by = "date") %>%
     drop_na() %>%
     select(date,
+           id:state_id,
            contains("year"),
            contains("month"),
            contains("weekday"),
@@ -446,23 +444,9 @@ models <- parallel::parLapply(cl, items_list, function(df) {
   #################
   # Training data #
   #################
-
+  
   train <- model_tbl %>%
-    filter(date >= "2012-01-01") 
-  
-  range(train$date)
-  
-  #################
-  # Random Forest #
-  #################
-  # 
-  rf <- ranger::ranger(
-    formula = Value ~ .,
-    data = train %>% select(-date),
-    importance = 'impurity',
-    #mtry = round(ncol(train)*.33),
-    num.trees = 1000
-  )
+    filter(date >= "2013-01-01") 
   
   ############
   # Forecast #
@@ -502,17 +486,17 @@ models <- parallel::parLapply(cl, items_list, function(df) {
     mutate(Roll_Sd_28_Shift = zoo::rollapply(Value, 28, sd, align = 'right', fill = NA)) %>%
     mutate(Roll_Sd_7_Shift = zoo::rollapply(Value, 7, sd, align = 'right', fill = NA)) %>%
     mutate(Roll_Sd_14_Shift = zoo::rollapply(Value, 14, sd, align = 'right', fill = NA)) %>%
-    mutate(Roll_Lm_28_Shift = zoo::rollapply(Value, 28, calc_trend, align = 'right', fill = NA)) %>%
-    mutate(Roll_Lm_14_Shift = zoo::rollapply(Value, 14, calc_trend, align = 'right', fill = NA)) %>%
-    mutate(Roll_Lm_7_Shift = zoo::rollapply(Value, 7, calc_trend, align = 'right', fill = NA)) %>%
-    select(date, Roll_Mean_28_Shift:Roll_Lm_7_Shift) %>%
+    select(date, Roll_Mean_28_Shift:Roll_Sd_14_Shift) %>%
     drop_na() %>%
     mutate(date = date + days(28))
   
   # future modeling table
   future_model_tbl <- future_calendar %>%
     select(date) %>%
-    mutate(dept_id = unique(df$dept_id),
+    mutate(id = unique(df$id),
+           store_item = unique(df$store_item),
+           item_id = unique(df$item_id),
+           dept_id = unique(df$dept_id),
            cat_id = unique(df$cat_id),
            store_id = unique(df$store_id),
            state_id = unique(df$state_id)) %>%
@@ -521,36 +505,108 @@ models <- parallel::parLapply(cl, items_list, function(df) {
     inner_join(future_lead_tbls, by = "date") %>%
     inner_join(future_lag_tbls, by = "date") %>%
     inner_join(future_fixed_tbls, by = "date") %>%
-    select(date, everything()) %>%
-    mutate(Zero_Demand = 0) %>%
-    replace(is.na(.), 0)
+    select(colnames(model_tbl %>% select(-Value))) %>%
+    replace(is.na(.), 0) 
   
-  rf_fcast <- predict(rf, data = future_model_tbl)$predictions
+  # h2o.init(nthreads = 1, port = 54321+unique(df$port))
+  # h2o.stopLogging()
+  # h2o.no_progress()
   
-  out <- future_model_tbl %>%
-    select(date) %>%
-    mutate(Prediction = rf_fcast) %>%
-    mutate(Prediction = ifelse(Prediction < 0, 0, Prediction)) %>%
-    mutate(id = paste(item_ID, store_ID, "evaluation", sep = "_")) %>%
-    inner_join(future_calendar %>%
-                 select(date, d),
-               by = "date") %>%
-    select(-date) %>%
-    spread(d, Prediction) %>%
-    setNames(., nm = c("id", paste("F", 1:28, sep = "")))
+  out <- bind_rows(
+    model_tbl %>% mutate(Split = "Train"),
+    future_model_tbl %>% mutate(Split = "Eval")
+  ) 
+    #h2o::as.h2o()
+    #data.table::as.data.table()
+  
+  # h2o.shutdown()
+  
+  rm(calendar_fixed)
+  rm(calendar_lag)
+  rm(point_indicators)
+  rm(model_tbl)
+  rm(train)
   
   return(out)
 })
+
+dt1 <- bind_rows(models)
+dt2 <- data.table::rbindlist(models[10001:20000])
+dt3 <- data.table::rbindlist(models[20001:30490])
+
+
+#model_list <- data.table::rbindlist(models)
+#h2o_df <- h2o.rbind(models)
+
+rm(models)
+gc()
+
+h2o.shutdown()
+h2o.init(nthreads = -1, min_mem_size = "280G")
+
+model_df <- h2o::as.h2o(dt1)
+
+#rm(items_list)
 
 end_time <- Sys.time()
 
 end_time - start_time
 
+
+#########
+## H2O ##
+#########
+
+model_df <- h2o.rbind(models)
+
+train <- model_df[model_df$Split == "Train",]
+train[, c(2,3,4,5,6,7,8)] <- as.factor(train[, c(2,3,4,5,6,7,8)])
+
+eval <- model_df[model_df$Split == "Eval",]
+eval[, c(2,3,4,5,6,7,8)] <- as.factor(eval[, c(2,3,4,5,6,7,8)])
+
+rm(dt1)
+gc()
+
+#h2o.init(nthreads = 46)
+
+ignore_features <- which(colnames(train) %in% c("date", "Value", "id", "store_item"))
+features <- colnames(train)[-ignore_features]
+y <- "Value"
+
+fit <- h2o.gbm(x = features,
+               y = y,
+               training_frame = train,
+               ntrees = 2000,
+               learn_rate = 0.05,
+               learn_rate_annealing = 0.99,
+               col_sample_rate = 0.67,
+               sample_rate = 0.67,
+               stopping_rounds = 0,
+               categorical_encoding = "Enum",
+               distribution = "tweedie")
+
+# function to return vector of predictions from H2O fitted models.
+predict_h2o <- function(m, test_df) {
+  test_df %>%
+    as.h2o() %>%
+    predict(m, newdata = .) %>%
+    as.vector()
+}
+
+fcast <- predict_h2o(fit, test_df = eval)
+
+eval[, "Value"] <- fcast
+
+
 ################
 ## Submission ##
 ################
 
-eval_pred <- bind_rows(models)
+eval_pred <- eval %>%
+  select(date, id, Value) %>%
+  spread(date, Value) %>%
+  setNames(., nm = c("id", paste("F", 1:28, sep = "")))
 
 val_pred <- eval_pred %>%
   mutate(id = str_replace_all(id, "evaluation", "validation"))
