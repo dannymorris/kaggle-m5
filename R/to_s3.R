@@ -7,8 +7,8 @@ install.packages("zoo")
 install.packages("data.table")
 install.packages("aws.s3", repos = "https://cloud.R-project.org")
 
-Sys.setenv("AWS_ACCESS_KEY_ID" = "AKIAI7MMCIQPQHNRG7HQ",
-           "AWS_SECRET_ACCESS_KEY" = "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",
+Sys.setenv("AWS_ACCESS_KEY_ID" = "",
+           "AWS_SECRET_ACCESS_KEY" = "",
            "AWS_DEFAULT_REGION" = "us-east-1")
 
 
