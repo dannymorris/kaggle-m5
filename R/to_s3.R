@@ -636,3 +636,6 @@ parallel::parLapply(cl, item_tbls, function(item) {
     bucket = "abn-distro"
   )
 })
+
+stopCluster(cl)
+gc()
