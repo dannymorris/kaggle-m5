@@ -7,7 +7,7 @@ library(parallel)
 sample_sub <- read_csv("sample_submission.csv")
 
 Sys.setenv("AWS_ACCESS_KEY_ID" = "",
-           ",
+           "AWS_SECRET_ACCESS_KEY" = "",
            "AWS_DEFAULT_REGION" = "us-east-1")
 
 #####################################

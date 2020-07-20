@@ -541,39 +541,7 @@ item_tbls <- parallel::parLapply(cl, items_list, function(df) {
     eval_meta = eval_meta,
     store_id = unique(df$store_id)
   )
-  
-  
-  # aws.s3::s3write_using(
-  #   x = train,
-  #   FUN = write_csv,
-  #   object = train_file_name,
-  #   bucket = "abn-distro"
-  # )
-  # 
-  # aws.s3::s3write_using(
-  #   x = eval,
-  #   FUN = write_csv,
-  #   object = eval_file_name,
-  #   bucket = "abn-distro"
-  # )
-  #  
-  # aws.s3::s3write_using(
-  #   x = eval_meta,
-  #   FUN = write_csv,
-  #   object = eval_meta_file_name,
-  #   bucket = "abn-distro"
-  # )
-  
-  #Sys.sleep(2)
-  
-  tt <- aws.s3::get_bucket_df(
-    bucket = "abn-distro",
-    prefix = "m5_store_items/eval/",
-    max = Inf
-  )
 
-  dim(tt)
-  
   rm(calendar_fixed)
   rm(calendar_lag)
   rm(point_indicators)
@@ -591,11 +559,6 @@ gc()
 n_cores <- parallel::detectCores()-4
 n_cores
 cl <- makeCluster(n_cores, type = "MPI")
-# clusterExport(cl, c("ohe_calendar",
-#                     "future_calendar",
-#                     "ohe_sports",
-#                     "future_sports_df",
-#                     "future_prices"))
 
 # load training to s3
 parallel::parLapply(cl, item_tbls, function(item) {
@@ -638,4 +601,85 @@ parallel::parLapply(cl, item_tbls, function(item) {
 })
 
 stopCluster(cl)
+gc()
+
+#############################
+## Upload store-level data ##
+#############################
+
+# this must be done after uploading product-level data
+
+install.packages("aws.s3", repos = "https://cloud.R-project.org")
+install.packages("data.table")
+
+library(tidyverse)
+library(aws.s3)
+library(parallel)
+library(data.table)
+
+Sys.setenv("AWS_ACCESS_KEY_ID" = "",
+           "AWS_SECRET_ACCESS_KEY" = "",
+           "AWS_DEFAULT_REGION" = "us-east-1")
+
+bucket <- "abn-distro"
+
+train_objects <- get_bucket_df(
+  bucket = bucket,
+  prefix = "m5_store_items/train/",
+  max = Inf
+)
+
+train_files <- as.list(train_objects$Key)
+
+# set up parallel cluster
+n_cores <- parallel::detectCores()-1
+n_cores
+cl <- makeCluster(n_cores)
+
+# get product-level data
+train_tbls <- parallel::parLapply(cl, train_files, function(i) {
+  
+  library(aws.s3)
+  library(data.table)
+  
+  bucket <- "abn-distro"
+  
+  s3read_using(
+    FUN = fread,
+    object = i,
+    bucket = bucket
+  ) 
+})
+
+# concatenate product-level data
+train_df <- data.table::rbindlist(train_tbls)
+
+rm(train_tbls)
+gc()
+
+# this should equal 10 for the 10 store ids
+length(unique(train_df$V4))
+
+# split training data by store id
+store_splits <- split(train_df, list(train_df$V4))
+
+# list of store ids
+store_ids <- as.list(seq(1, length(store_splits), 1))
+
+rm(train_df)
+gc()
+
+map(store_ids, function(i) {
+  object_name <- paste("m5_store_items/train_stores/store_", i, ".csv", sep="")
+  s3write_using(
+    x = store_splits[i],
+    FUN = fwrite,
+    bucket = bucket,
+    object = object_name,
+    col.names = F,
+    row.names = F
+  )
+})
+
+rm(store_splits)
 gc()
