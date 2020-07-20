@@ -40,8 +40,8 @@ sharded_training_params = {
     },
     "ResourceConfig": {
         "InstanceCount": 10,
-        "InstanceType": "ml.m4.4xlarge",
-        "VolumeSizeInGB": 10
+        "InstanceType": "ml.m5.4xlarge",
+        "VolumeSizeInGB": 20
     },
     "InputDataConfig": [
         {
@@ -67,7 +67,6 @@ sharded_training_params = {
         "objective": "reg:tweedie",
         "tweedie_variance_power": "1.1",
         "eval_metric": "rmse",
-        "rate_drop": "0.2",
         "min_child_weight": "7",
         "colsample_bytree": "0.8",
         "subsample": "0.8"

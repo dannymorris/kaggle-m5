@@ -39,9 +39,9 @@ sharded_training_params = {
         "TrainingInputMode": "File"
     },
     "ResourceConfig": {
-        "InstanceCount": 15,
-        "InstanceType": "ml.m4.4xlarge",
-        "VolumeSizeInGB": 10
+        "InstanceCount": 10,
+        "InstanceType": "ml.m5.4xlarge",
+        "VolumeSizeInGB": 20
     },
     "InputDataConfig": [
         {
@@ -49,7 +49,7 @@ sharded_training_params = {
             "ContentType": "csv",
             "DataSource": {
                 "S3DataSource": {
-                    "S3DataDistributionType": "FullyReplicated",
+                    "S3DataDistributionType": "ShardedByS3Key",
                     "S3DataType": "S3Prefix",
                     "S3Uri": "s3://{}/{}/train_stores/".format(bucket, prefix)
                 }
@@ -62,12 +62,11 @@ sharded_training_params = {
         "S3OutputPath": "s3://{}/{}/".format(bucket, prefix)
     },
     "HyperParameters": {
-        "num_round": "3000",
+        "num_round": "1500",
         "eta": "0.1",
         "objective": "reg:tweedie",
         "tweedie_variance_power": "1.1",
         "eval_metric": "rmse",
-        "rate_drop": "0.2",
         "min_child_weight": "7",
         "colsample_bytree": "0.8",
         "subsample": "0.8"
