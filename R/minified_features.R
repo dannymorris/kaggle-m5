@@ -3,8 +3,8 @@
 
 ## Run this on EC2 using RStudio AMI
 
-Sys.setenv("AWS_ACCESS_KEY_ID" = "AKIAIFR2Z22DZKZFLTIQ",
-           "AWS_SECRET_ACCESS_KEY" = "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",
+Sys.setenv("AWS_ACCESS_KEY_ID" = "",
+           "AWS_SECRET_ACCESS_KEY" = "",
            "AWS_DEFAULT_REGION" = "us-east-1")
 
 setwd("~/kaggle-m5")
