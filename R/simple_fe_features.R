@@ -9,6 +9,11 @@
 
 ## Run this on EC2 using RStudio AMI
 
+install.packages("recipes")
+install.packages("zoo")
+install.packages("data.table")
+install.packages("aws.s3", repos = "https://cloud.R-project.org")
+
 Sys.setenv("AWS_ACCESS_KEY_ID" = "AKIAIXTUNK23YFUWQFYQ",
            "AWS_SECRET_ACCESS_KEY" = "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",
            "AWS_DEFAULT_REGION" = "us-east-1")
@@ -18,11 +23,6 @@ setwd("~/kaggle-m5")
 ###############
 ## Libraries ##
 ###############
-
-install.packages("recipes")
-install.packages("zoo")
-install.packages("data.table")
-install.packages("aws.s3", repos = "https://cloud.R-project.org")
 
 library(tidyverse)
 library(recipes) 
@@ -64,10 +64,9 @@ calendar <- s3read_using(
 ) %>%
   as_tibble() %>%
   mutate(date = as.Date(date)) %>%
-  filter(date >= "2012-01-01") %>%
-  filter((month %in% c(3,4,5,6)) | year == 2016) 
+  filter(date >= "2013-01-01") 
 
-train_d <- calendar$d[1:631]
+train_d <- calendar$d[1:1238]
 future_d <- paste("d", 1942:1969, sep = "_")
 
 # prices
@@ -108,10 +107,11 @@ item_enc <- eval_df %>%
 # weekday, weekmonth, month, year
 date_enc <- calendar %>%
   mutate(weekmonth = stringi::stri_datetime_fields(date)$WeekOfMonth) %>%
+  mutate(monthday = lubridate::mday(date)) %>%
   mutate(week = lubridate::week(date)) %>%
   mutate(quarter = lubridate::quarter(date)) %>%
   mutate(day = lubridate::day(date)) %>%
-  select(weekday, weekmonth, month, year, quarter, week, date) %>%
+  select(weekday, weekmonth, monthday, month, year, quarter, week, date) %>%
   mutate_at(vars(-date), as.factor) %>%
   mutate_at(vars(-date), label_enc)
 
@@ -221,72 +221,72 @@ model_df <- prices %>%
   select(-store_item, -d, -wm_yr_wk) %>%
   select(id, date, Value, sell_price, snap_CA:state_id)
 
-train <- model_df %>%
-  filter(date < "2016-05-23") %>%
-  select(-date, -id)
+model_dt <- as.data.table(model_df)
 
-eval <- model_df %>%
-  filter(date >= "2016-05-23") %>%
-  select(-Value)
-
-# s3write_using(
-#   x = train,
-#   FUN = fwrite,
-#   object = "m5_store_items/train/train.csv",
-#   bucket = "abn-distro",
-#   col.names = F,
-#   row.names = F
-# )
-
-# s3write_using(
-#   x = eval,
-#   FUN = fwrite,
-#   object = "m5_store_items/eval/eval.csv",
-#   bucket = "abn-distro",
-#   col.names = F,
-#   row.names = F
-# )
-
-##############
-## Training ##
-##############
-
-rm(demand_long)
-rm(eval_df)
 rm(model_df)
-rm(prices)
 gc()
 
-library(h2o) # install.packages("h2o")
+lag <- c(7, 28, 60) 
+lag_cols <- paste0("lag_", lag) # lag columns names
+model_dt[, (lag_cols) := shift(.SD, lag), by = id, .SDcols = "Value"] # add lag vectors
 
+win <- c(7, 28, 60) # rolling window size
+roll_cols <- paste0("rmean_", t(outer(lag, win, paste, sep="_"))) # rolling features columns names
+model_dt[, (roll_cols) := frollmean(.SD, win, na.rm = TRUE), by = id, .SDcols = lag_cols] # rolling features on lag_cols
+
+stores <- unique(model_dt$store_id)
+
+library(h2o)
 h2o.init()
 
-x <- train %>% select(-Value) %>% colnames()
-y <- "Value"
+models <- map(stores, function(store) {
+  
+  store_dt <- model_dt[store_id == store]
+  
+  train_dt <- store_dt[date < "2016-05-23",.SD, .SDcols = !c('date', 'id', 'lag_7')]
+  train_dt <- na.omit(train_dt)
+  
+  eval_dt <- store_dt[date >= "2016-05-23",.SD, .SDcols = !c('Value', 'lag_7')]
+  
+  x <- colnames(train_dt[,.SD, .SDcols = !c('Value')])
+  y <- "Value"
+  
+  train_hex <- as.h2o(train_dt)
+  eval_hex <- as.h2o(eval_dt)
+  
+  train_gbm <- h2o.gbm(
+    x = x,
+    y = y,
+    training_frame = train_hex,
+    ntrees = 1500,
+    stopping_metric = "RMSE",
+    stopping_rounds = 500,
+    distribution = "poisson",
+    sample_rate = 0.8,
+    col_sample_rate = 0.8,
+    learn_rate = 0.075
+  )
+  
+  pred <- predict(train_gbm, eval_hex)
+  
+  pred_ids_chr <- paste0("F", 1:28)
+  pred_ids_int <- rep(1:28, length(unique(eval_dt$id)))
+  
+  eval_pred <- eval_dt %>%
+    select(id) %>%
+    mutate(pred = as.vector(pred)) %>%
+    mutate(pred_id = pred_ids_int) %>%
+    tidyr::spread(pred_id, pred) %>%
+    setNames(., nm = c("id", pred_ids_chr))
+  
+  h2o.rm(train_hex)
+  h2o.rm(eval_hex)
+  h2o.rm(train_gbm)
+  
+  return(eval_pred)
+})
 
-train_gbm <- h2o.gbm(
-  x = x,
-  y = y,
-  training_frame = as.h2o(train),
-  ntrees = 1500,
-  stopping_metric = "RMSE",
-  stopping_rounds = 500,
-  distribution = "poisson",
-  sample_rate = 0.8,
-  col_sample_rate = 0.8
-)
-
-pred <- predict(train_gbm, as.h2o(eval))
-
-pred_ids_chr <- paste0("F", 1:28) %>% rep(30490)
-pred_ids_int <- rep(1:28, 30490)
-
-eval_pred <- eval %>%
-  select(id) %>%
-  mutate(pred = as.vector(pred)) %>%
-  mutate(pred_id = pred_ids_int) %>%
-  tidyr::spread(pred_id, pred) %>%
-  setNames(., nm = c("id", pred_ids_chr))
+eval_pred <- bind_rows(models)
 
 val_pred <- eval_pred %>%
   mutate(id = str_replace(id, "evaluation", "validation"))
@@ -303,15 +303,11 @@ final_sub <- sample_sub %>%
   select(id) %>%
   inner_join(all_pred, by = "id")
 
-all.equal(colnames(final_sub), colnames(sample_sub))
-
 s3write_using(
   x = final_sub,
-  object = "m5_store_items/submissions/minified_h2o_gbm_poisson_1500.csv",
+  object = "m5_store_items/submissions/simple_fe_h2o_gbm_poisson_1500.csv",
   bucket = "abn-distro",
   FUN = fwrite
 )
 
 h2o.shutdown()
-
-# private score: 0.8 :(
