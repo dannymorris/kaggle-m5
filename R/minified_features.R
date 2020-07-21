@@ -1,5 +1,11 @@
-# This script generates product-level training data.
-# Each individual training data set (by product) is uploaded to S3 as a CSV file
+
+# This script generates the following features:
+# - sell price
+# - calendar label encoded
+# - item label encoded
+# - sports one-hot encoded
+# - holidays one-hot encoded
+# - no rolling lags
 
 ## Run this on EC2 using RStudio AMI
 
