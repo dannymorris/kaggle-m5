@@ -1,21 +1,31 @@
-##################
-## Create model ##
-##################
+import boto3
+from sagemaker import get_execution_role
+import sagemaker.amazon.common as smac
+import argparse
 
+# Execution role
+role = get_execution_role()
+
+# Input args
+ap = argparse.ArgumentParser()
+ap.add_argument("-m", "--modelname", required=True, help="model name")
+ap.add_argument("-u", "--modelurl", required=True, help="model data url")
+args = vars(ap.parse_args())
+
+# Configure SageMaker
 region = boto3.Session().region_name
 sm = boto3.Session().client('sagemaker')
 
+# Xgboost container
 from sagemaker.amazon.amazon_estimator import get_image_uri
 container = get_image_uri(boto3.Session().region_name, 'xgboost')
 
-model_name = 'm5-sharded-xgboost-2020-07-19-17-02-04'
-model_url = 's3://abn-distro/m5_store_items/m5-sharded-xgboost-2020-07-19-17-02-04/output/model.tar.gz'
-
+# Create model
 sharded_model_response = sm.create_model(
-    ModelName=model_name,
+    ModelName=args["modelname"],
     ExecutionRoleArn=role,
     PrimaryContainer={
         'Image': container,
-        'ModelDataUrl': model_url
+        'ModelDataUrl': args["modelurl"]
     }
 )
