@@ -3,15 +3,20 @@
 
 ## Run this on EC2 using RStudio AMI
 
-install.packages("recipes")
-install.packages("zoo")
-install.packages("data.table")
-install.packages("aws.s3", repos = "https://cloud.R-project.org")
-
 Sys.setenv("AWS_ACCESS_KEY_ID" = "",
            "AWS_SECRET_ACCESS_KEY" = "",
            "AWS_DEFAULT_REGION" = "us-east-1")
 
+setwd("~/kaggle-m5")
+
+###############
+## Libraries ##
+###############
+
+install.packages("recipes")
+install.packages("zoo")
+install.packages("data.table")
+install.packages("aws.s3", repos = "https://cloud.R-project.org")
 
 library(tidyverse)
 library(recipes) 
@@ -19,192 +24,189 @@ library(lubridate)
 library(zoo)
 library(parallel)
 library(data.table)
+library(aws.s3)
 
+###############
+## Functions ##
+###############
 
-setwd("~/kaggle-m5")
+label_enc <- function(x) {
+  as.numeric(x)
+}
+
+replace_na <- function(x) {
+  ifelse(is.na(x), 0, x)
+}
+
+nearest_val <- function(x) {
+  data.table::nafill(x, "locf")
+}
+
+##############
+## Raw data ##
+##############
 
 # calendar reference
-calendar <- read_csv("data/calendar.csv")
+calendar <- s3read_using(
+  object = "m5_store_items/raw_data/calendar.csv",
+  bucket = "abn-distro",
+  FUN = fread
+) %>%
+  as_tibble() %>%
+  mutate(date = as.Date(date)) %>%
+  filter(date >= "2012-01-01") %>%
+  filter((month %in% c(3,4,5,6)) | year == 2016) 
+
+train_d <- calendar$d[1:631]
+future_d <- paste("d", 1942:1969, sep = "_")
 
 # prices
-prices <- read_csv("data/sell_prices.csv") %>%
+prices <- s3read_using(
+  object = "m5_store_items/raw_data/sell_prices.csv",
+  bucket = "abn-distro",
+  FUN = fread
+) %>%
+  semi_join(calendar, by = "wm_yr_wk") %>%
   mutate(store_item = paste(item_id, store_id, sep = "_")) %>%
-  select(-item_id,
-         -store_id)
+  as_tibble()
 
-# training set
-eval_df <- read_csv("data/sales_train_evaluation.csv") %>%
-  mutate(store_item = paste(item_id, store_id, sep = "_"))
-
-sample_df <- eval_df %>%
-  gather(Date, Value, -id:-state_id, -store_item) %>%
-  inner_join(calendar, by = c("Date" = "d")) %>%
-  left_join(prices, by = c("store_item", "wm_yr_wk")) %>%
-  select(id,
-         item_id,
-         dept_id,
-         cat_id,
-         store_id,
-         state_id,
-         Date,
-         wm_yr_wk,
-         Value,
-         date,
-         store_item,
-         weekday,
-         month)
+# sales
+eval_df <- s3read_using(
+  object = "m5_store_items/raw_data/sales_train_evaluation.csv",
+  bucket = "abn-distro",
+  FUN = fread
+) %>%
+  select(id:state_id, all_of(train_d)) %>%
+  as_tibble()
 
 range(sample_df$date)
 
-###########
-## Items ##
-###########
+#################
+## Item encode ##
+#################
 
-label_enc <- function(x) {
-  as.numeric(x)-1
-}
+item_enc <- eval_df %>%
+  select(id, item_id, dept_id, cat_id, store_id, state_id) %>%
+  mutate_at(vars(-id), as.factor) %>%
+  mutate_at(vars(-id), label_enc)
 
-item_ohe <- eval_df %>%
-  select(store_item, item_id, dept_id, cat_id, store_id, state_id) %>%
-  mutate_at(vars(-store_item),as.factor) %>%
-  mutate_at(vars(-store_item),label_enc)
-# mutate(item_id = as.numeric(item_id)-1) %>%
-# recipes::recipe(~., data = .) %>%
-# step_dummy(all_predictors(), -store_item, -item_id, one_hot = T) %>%
-# prep() %>%
-# juice()
-
-##############
-## Calendar ##
-##############
+#####################
+## Calendar encode ##
+#####################
 
 # one-hot enconde date components
 # weekday, weekmonth, month, year
-ohe_date <- calendar %>%
+date_enc <- calendar %>%
   mutate(weekmonth = stringi::stri_datetime_fields(date)$WeekOfMonth) %>%
-  select(weekday, weekmonth, month, year) %>%
-  mutate_all(as.factor) %>%
-  mutate_all(label_enc)
+  mutate(week = lubridate::week(date)) %>%
+  mutate(quarter = lubridate::quarter(date)) %>%
+  mutate(day = lubridate::day(date)) %>%
+  select(weekday, weekmonth, month, year, quarter, week, date) %>%
+  mutate_at(vars(-date), as.factor) %>%
+  mutate_at(vars(-date), label_enc)
 
-# one-hot encode holidays
-ohe_holidays <- calendar %>%
+#####################
+## Holidays encode ##
+#####################
+
+holidays_enc <- calendar %>%
   select(date, contains("event")) %>%
-  gather(key, event, -date) %>%
-  drop_na() %>%
-  select(-key) %>%
-  mutate(Ind = 1) %>%
-  mutate(event = str_replace_all(event, " ", "")) %>%
-  mutate(event = str_replace_all(event, "[^[:alnum:]]", "")) %>%
-  mutate(event = paste("event", event, sep = "_")) %>%
-  distinct() %>%
-  spread(event, Ind, fill = 0) 
+  replace(is.na(.), "unknown") %>%
+  mutate_at(vars(-date), as.factor) %>%
+  mutate_at(vars(-date), label_enc) 
 
-# combine OHE dates and holidays
-ohe_calendar <- calendar %>%
-  select(date, d, wm_yr_wk, contains("snap")) %>%
-  bind_cols(ohe_date) %>%
-  left_join(ohe_holidays, by = "date") %>%
-  replace(is.na(.), 0)
+holiday_lead <- map(seq(1, 2, 1), function(val) {
+  lead_val <- function(x) lead(x, val)
+  holidays_enc %>%
+    select(-date) %>%
+    mutate_all(list(lead_val)) %>%
+    setNames(., nm = paste(names(.), "Lead", val, sep = "_")) 
+}) %>%
+  bind_cols()
 
-# future calendar dates
-future_calendar <- ohe_calendar %>%
-  filter(date >= "2016-05-23")
+holidays_df <- bind_cols(holidays_enc, holiday_lead)
 
-range(future_calendar$date)
-
-
-##########
-# Prices #
-##########
-
-future_prices <- prices %>%
-  inner_join(future_calendar %>%
-               select(date, wm_yr_wk), 
-             by = "wm_yr_wk")
-
-range(future_prices$date)
 
 #################
 ## Sports data ##
 #################
 
-# NFL Sunday and College football Saturday
-football <- calendar %>%
-  select(date, weekday, month) %>%
-  distinct() %>%
-  mutate(NFL_Sun = ifelse(weekday == "Sunday" & (month > 8 | month < 2), 1, 0)) %>%
-  mutate(NCAA_Sat = ifelse(weekday == "Saturday" & (month > 8 & month <= 12), 1, 0)) %>%
-  select(date, NFL_Sun, NCAA_Sat) %>%
-  distinct()
-
-# NBA Finals schedule
-# nba_finals <- nbastatR::seasons_schedule(2011:2016, season_types = 'Playoffs') %>%
-#   mutate(Month = lubridate::month(dateGame)) %>%
-#   filter(Month == 6) %>%
-#   select(date = dateGame) %>%
-#   mutate(NBA_Finals = 1)
-nba_finals <- read_csv("data/nba_finals.csv")
+nba_finals <-  s3read_using(
+  object = "m5_store_items/raw_data/nba_finals.csv",
+  bucket = "abn-distro",
+  FUN = read_csv
+)
 
 # US Open (Sundays)
-us_open <- read_csv("data/us_open.csv") %>%
+us_open <-  s3read_using(
+  object = "m5_store_items/raw_data/us_open.csv",
+  bucket = "abn-distro",
+  FUN = read_csv
+) %>%
   mutate(date = lubridate::mdy(date)) %>%
   mutate(USO_Sunday = 1) %>%
   select(-event)
 
 # MLB schedule for teams in WI, CA, and TX
-mlb <- read_csv('data/mlb_games.csv')
+mlb <-  s3read_using(
+  object = "m5_store_items/raw_data/mlb_games.csv",
+  bucket = "abn-distro",
+  FUN = read_csv
+)
 
 # Horse racing (triple crown)
-horse_race <- read_csv("data/horse_racing.csv") %>%
+horse_race <-  s3read_using(
+  object = "m5_store_items/raw_data/horse_racing.csv",
+  bucket = "abn-distro",
+  FUN = read_csv
+) %>%
   mutate(date = lubridate::mdy(date)) %>%
   mutate(Horse_Race = 1) %>%
-  spread(event, Horse_Race, fill = 0)
+  select(-event) %>%
+  distinct()
 
 # Combine football, nba, us open, mlb, and horse racing
-ohe_sports <- left_join(football, nba_finals, by = "date") %>%
+sports_df <- nba_finals %>%
   left_join(us_open, by = "date") %>%
   left_join(mlb, by = "date") %>%
   left_join(horse_race, by = "date") %>%
   replace(is.na(.), 0)
 
-# future sports dates
-future_sports_df <- future_calendar %>%
-  mutate(NFL_Sun = ifelse(weekday == "Sunday" & (month > 8 | month < 2), 1, 0)) %>%
-  mutate(NCAA_Sat = ifelse(weekday == "Saturday" & (month > 8 & month <= 12), 1, 0)) %>%
-  select(date, NFL_Sun, NCAA_Sat) %>%
-  left_join(nba_finals, by = "date") %>%
-  left_join(us_open, by = "date") %>%
-  left_join(mlb, by = "date") %>%
-  left_join(horse_race, by = "date") %>%
-  replace(is.na(.), 0) %>%
-  distinct()
-
-range(future_sports_df$date)
-
 ################
 ## Items list ##
 ################
 
+calendar_enc <- calendar %>%
+  select(date, d, wm_yr_wk, contains("snap")) %>%
+  inner_join(date_enc, by = "date") %>%
+  inner_join(holidays_df, by = "date") %>%
+  left_join(sports_df, by = "date")
+
+sample_df <- eval_df %>%  
+  select(item_id, store_id, contains("d_")) %>%
+  gather(Date, Value, -item_id, -store_id) %>%
+  # left_join(calendar_enc, ., by = c("d" = "Date")) %>%
+  # mutate_at(vars(NBA_Finals:Horse_Race), replace_na) %>%
+  left_join(prices, ., by = c("store_id", "item_id", "wm_yr_wk")) 
+  #select(store_item, date, d, Value, contains("snap"), weekday:sell_price)
+
+demand_long <- eval_df %>% 
+  select(item_id, store_id, contains('d_')) %>%
+  gather(d, Value, -item_id, -store_id)
+
+sample_df <- prices %>%
+  inner_join(calendar %>% select(wm_yr_wk, date, d), by = "wm_yr_wk") %>%
+  left_join(demand_long, by = c("store_id", "item_id", "d"))
+
+aws.s3::s3write_using(
+  x = sample_df,
+  FUN = fwrite,
+  bucket = "abn-distro",
+  object = "sample_df.csv"
+)
 # separate all items using list
 # modeling will use split-apply-combine method
-items_list <- sample_df %>%
-  select(id, store_item, wm_yr_wk, date, Value) %>%
-  inner_join(prices, by = c("store_item", "wm_yr_wk")) %>%
-  inner_join(item_ohe, by = "store_item") %>%
-  # select(id,
-  #        store_item,
-  #        # item_id,
-  #        # dept_id,
-  #        # cat_id,
-  #        # store_id,
-  #        # state_id,
-  #        colnames(item_ohe),
-  #        date,
-  #        wm_yr_wk,
-  #        contains("snap"),
-#        sell_price,
-#        Value) %>%
-split(., .$store_item)
+items_list <- sample_df %>% split(., .$store_item)
 
 rm(sample_df)
 rm(prices)
@@ -232,59 +234,9 @@ item_tbls <- parallel::parLapply(cl, items_list, function(df) {
   library(tidyverse)
   library(lubridate)
   library(zoo)
-
-  ######################################
-  ## Sales data with point indicators ##
-  ######################################
   
-  # combine daily calendar, sports, prices data
-  # no lead/lag indicators yet
-  point_indicators <- df %>%
-    left_join(ohe_calendar, by = "date") %>%
-    left_join(ohe_sports, by = "date") %>%
-    #filter(date <= "2016-06-21") %>%
-    select(-contains("NBAFinalsEnd"),
-           -contains("NBAFinalsStart")) %>%
-    drop_na()
-  
-  lead_ref <- ohe_calendar %>%
-    left_join(ohe_sports, by = "date") %>%
-    left_join(df, by = "date") %>%
-    filter(date <= "2016-05-24", date >= "2016-05-23") %>%
-    select(-contains("NBAFinalsEnd"),
-           -contains("NBAFinalsStart")) %>%
-    select(colnames(point_indicators))
-  
-  #################################
-  ## Calendar leading indicators ##
-  #################################
-  
-  # calendar events that are known in advance
-  # variables: holidays, sports
-  calendar_lead_vars <- point_indicators %>%
-    select(date, 
-           contains('event'),
-           contains("MLB"),
-           NFL_Sun,
-           NCAA_Sat,
-           NBA_Finals,
-           USO_Sunday,
-           contains("Horse")) %>%
-    distinct() 
-  
-  calendar_lead_vars <- calendar_lead_vars %>%
-    bind_rows(lead_ref %>% select(colnames(calendar_lead_vars)))
-  
-  # create leading indicators up to 2 days
-  calendar_lead <- map(seq(1, 2, 1), function(val) {
-    lead_val <- function(x) lead(x, val)
-    calendar_lead_vars %>%
-      select(-date) %>%
-      mutate_all(list(lead_val)) %>%
-      setNames(., nm = paste(names(.), "Lead", val, sep = "_"))
-  }) %>%
-    bind_cols(calendar_lead_vars, .) %>%
-    drop_na()
+  future_df <- df %>%
+    filter(date >= "2016-05-23")
   
   # future leads
   future_lead_vars <- future_calendar %>%
@@ -542,7 +494,7 @@ item_tbls <- parallel::parLapply(cl, items_list, function(df) {
     eval_meta = eval_meta,
     store_id = unique(df$store_id)
   )
-
+  
   rm(calendar_fixed)
   rm(calendar_lag)
   rm(point_indicators)
@@ -550,7 +502,7 @@ item_tbls <- parallel::parLapply(cl, items_list, function(df) {
   rm(train)
   
   return(out)
-
+  
 })
 
 stopCluster(cl)
