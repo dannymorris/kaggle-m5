@@ -14,8 +14,8 @@ install.packages("zoo")
 install.packages("data.table")
 install.packages("aws.s3", repos = "https://cloud.R-project.org")
 
-Sys.setenv("AWS_ACCESS_KEY_ID" = "AKIAIXTUNK23YFUWQFYQ",
-           "AWS_SECRET_ACCESS_KEY" = "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",
+Sys.setenv("AWS_ACCESS_KEY_ID" = "",
+           "AWS_SECRET_ACCESS_KEY" ",
            "AWS_DEFAULT_REGION" = "us-east-1")
 
 setwd("~/kaggle-m5")
